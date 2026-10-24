@@ -1,9 +1,12 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 
 const STEP_TYPE = 'navigate_to_website'
+const CLICK_STEP_TYPE = 'click'
+const FILL_STEP_TYPE = 'fill'
 const API_ROOT = 'http://127.0.0.1:8000/api'
 
 const makeKey = (prefix) => `${prefix}-${crypto.randomUUID()}`
+const stepLabel = (step) => (step.type === CLICK_STEP_TYPE ? 'Click' : step.type === FILL_STEP_TYPE ? 'Fill' : 'Navigate to website')
 
 const blankDefinition = () => ({
   schema_version: 1,
@@ -176,6 +179,14 @@ function App() {
     }))
   }
 
+  const deleteStep = (stepId) => {
+    updateActiveRecipe((recipe) => ({
+      ...recipe,
+      definition: { ...recipe.definition, steps: recipe.definition.steps.filter((step) => step.id !== stepId) },
+    }))
+    setSelectedStepId(null)
+  }
+
   const addNavigationStep = (position = { x: 48, y: 48 }) => {
     const step = {
       id: makeKey('step'),
@@ -189,6 +200,38 @@ function App() {
       definition: { ...recipe.definition, steps: [...recipe.definition.steps, step] },
     }))
     setSelectedStepId(step.id)
+  }
+
+  const addClickStep = (position = { x: 48, y: 48 }, selector = '') => {
+    const step = {
+      id: makeKey('step'),
+      type: CLICK_STEP_TYPE,
+      settings: { selector },
+      connections: { next: [] },
+      position,
+    }
+    updateActiveRecipe((recipe) => ({
+      ...recipe,
+      definition: { ...recipe.definition, steps: [...recipe.definition.steps, step] },
+    }))
+    setSelectedStepId(step.id)
+    return step.id
+  }
+
+  const addFillStep = (position = { x: 48, y: 48 }, selector = '', value = '') => {
+    const step = {
+      id: makeKey('step'),
+      type: FILL_STEP_TYPE,
+      settings: { selector, value },
+      connections: { next: [] },
+      position,
+    }
+    updateActiveRecipe((recipe) => ({
+      ...recipe,
+      definition: { ...recipe.definition, steps: [...recipe.definition.steps, step] },
+    }))
+    setSelectedStepId(step.id)
+    return step.id
   }
 
   const persistStudio = async () => {
@@ -292,7 +335,10 @@ function App() {
             updateStudio={updateStudio}
             updateActiveRecipe={updateActiveRecipe}
             updateStep={updateStep}
+            deleteStep={deleteStep}
             addNavigationStep={addNavigationStep}
+            addClickStep={addClickStep}
+            addFillStep={addFillStep}
             saveStudio={saveStudio}
             runFullRecipe={runFullRecipe}
             newRecipe={createRecipe}
@@ -316,19 +362,66 @@ function App() {
 }
 
 function StudioView({
-  studio, activeRecipe, activeRecipeKey, setActiveRecipeKey, updateRecipe, deleteRecipe, selectedStepId, setSelectedStepId, updateStudio, updateActiveRecipe, updateStep,
-  addNavigationStep, saveStudio, runFullRecipe, newRecipe,
+  studio, activeRecipe, activeRecipeKey, setActiveRecipeKey, updateRecipe, deleteRecipe, selectedStepId, setSelectedStepId, updateStudio, updateActiveRecipe, updateStep, deleteStep,
+  addNavigationStep, addClickStep, addFillStep, saveStudio, runFullRecipe, newRecipe,
 }) {
   const [editingRecipeKey, setEditingRecipeKey] = useState(null)
   const [rightMode, setRightMode] = useState('viewer')
-  const [execution, setExecution] = useState({ status: 'idle', frame: null, logs: [], error: null })
+  const [pickerActive, setPickerActive] = useState(false)
+  const [pickerTargetStepId, setPickerTargetStepId] = useState(null)
+  const [pickerAction, setPickerAction] = useState('click')
+  const [pickerValue, setPickerValue] = useState('')
+  const [pickerTrial, setPickerTrial] = useState({ status: 'idle', selector: '', error: null, trialId: null })
+  const [execution, setExecution] = useState({ status: 'idle', frame: null, logs: [], error: null, pickerElement: null, navigationRunId: null, navigationStatus: 'idle' })
   const inputQueueRef = useRef(Promise.resolve())
   const steps = activeRecipe?.definition.steps || []
   const selectedStep = steps.find((step) => step.id === selectedStepId)
+  const firstStep = steps[0]
+  const navigationReadyToAddActivities = firstStep?.type === STEP_TYPE && Boolean(firstStep.settings?.url?.trim())
+  const navigationRunCompleted = navigationReadyToAddActivities
+    && execution.navigationStatus === 'completed'
+    && Boolean(execution.navigationRunId)
 
   const runStepLive = async (step) => {
+    const stepIndex = steps.findIndex((item) => item.id === step.id)
+    if (stepIndex > 0 && !navigationRunCompleted) return
+    const interactiveStep = step.type === CLICK_STEP_TYPE || step.type === FILL_STEP_TYPE
+    const activeNavigationRunId = interactiveStep && navigationRunCompleted ? execution.navigationRunId : null
+    if (interactiveStep) {
+      setRightMode('viewer')
+      setPickerActive(false)
+      if (!activeNavigationRunId) {
+        setExecution((current) => ({ ...current, status: 'failed', error: 'Run Navigate to website first so this activity can use the loaded browser.' }))
+        return
+      }
+      setExecution((current) => ({ ...current, status: 'running', stepId: step.id, stepType: step.type, error: null }))
+      try {
+        await api(`/step-runs/${activeNavigationRunId}/input`, {
+          method: 'POST',
+          body: JSON.stringify(step.type === FILL_STEP_TYPE
+            ? { type: 'selector_fill', selector: step.settings?.selector || '', value: step.settings?.value || '' }
+            : { type: 'selector_click', selector: step.settings?.selector || '' }),
+        })
+      } catch (reason) {
+        setExecution((current) => ({ ...current, status: 'failed', error: reason.message }))
+      }
+      return
+    }
     setRightMode('viewer')
-    setExecution({ status: 'running', frame: null, logs: [], error: null, runId: null })
+    setPickerActive(false)
+    if (execution.navigationRunId && execution.navigationStatus === 'completed') {
+      setExecution((current) => ({ ...current, runId: current.navigationRunId, status: 'running', stepId: step.id, stepType: step.type, error: null }))
+      try {
+        await api(`/step-runs/${execution.navigationRunId}/input`, {
+          method: 'POST',
+          body: JSON.stringify({ type: 'navigate', url: step.settings?.url || '' }),
+        })
+      } catch (reason) {
+        setExecution((current) => ({ ...current, status: 'failed', error: reason.message }))
+      }
+      return
+    }
+    setExecution({ status: 'running', frame: null, logs: [], error: null, runId: null, navigationRunId: null, navigationStatus: 'running', pickerElement: null, stepId: step.id, stepType: step.type })
     try {
       let startResponse
       try {
@@ -342,7 +435,7 @@ function StudioView({
       }
       const started = await startResponse.json()
       if (!startResponse.ok) throw new Error(started.error || 'Unable to start step')
-      setExecution((current) => ({ ...current, runId: started.run_id }))
+      setExecution((current) => ({ ...current, runId: started.run_id, navigationRunId: started.run_id, navigationStatus: 'running' }))
       let eventResponse
       try {
         eventResponse = await fetch(`${API_ROOT}/step-runs/${started.run_id}/events`)
@@ -364,8 +457,13 @@ function StudioView({
           const event = JSON.parse(line.slice(6))
           if (event.type === 'frame') setExecution((current) => ({ ...current, frame: event.data }))
           if (event.type === 'log') setExecution((current) => ({ ...current, logs: [...current.logs, event.message] }))
-          if (event.type === 'status') setExecution((current) => ({ ...current, status: event.status }))
-          if (event.type === 'complete') setExecution((current) => ({ ...current, status: event.status, error: event.error || null }))
+          if (event.type === 'inspect') setExecution((current) => ({ ...current, pickerElement: event.element || null }))
+          if (event.type === 'action_complete') {
+            if (event.trial_id) setPickerTrial((current) => current.trialId === event.trial_id ? { ...current, status: event.status, error: event.error || null } : current)
+            else setExecution((current) => ({ ...current, status: event.status, error: event.error || null, ...(event.action === 'navigate' ? { navigationStatus: event.status } : {}) }))
+          }
+          if (event.type === 'status') setExecution((current) => ({ ...current, status: event.status, ...(step.type === STEP_TYPE ? { navigationStatus: event.status } : {}) }))
+          if (event.type === 'complete') setExecution((current) => ({ ...current, status: event.status, error: event.error || null, ...(step.type === STEP_TYPE ? { navigationStatus: event.status } : {}) }))
         }
         if (done) break
       }
@@ -375,9 +473,10 @@ function StudioView({
   }
 
   const sendViewerInput = (payload) => {
-    if (!execution.runId) return
+    const browserRunId = execution.navigationRunId || execution.runId
+    if (!browserRunId) return
     inputQueueRef.current = inputQueueRef.current
-      .then(() => api(`/step-runs/${execution.runId}/input`, {
+      .then(() => api(`/step-runs/${browserRunId}/input`, {
         method: 'POST',
         body: JSON.stringify(payload),
       }))
@@ -385,15 +484,86 @@ function StudioView({
   }
 
   const selectStep = (stepId) => {
+    setPickerActive(false)
+    setPickerTrial({ status: 'idle', selector: '', error: null, trialId: null })
     setSelectedStepId(stepId)
     setRightMode('editor')
   }
-  const showViewerFromBackground = (event) => {
-    if (!event.target.closest('button, input, textarea, select, a, .step-name')) setRightMode('viewer')
+  const activatePicker = (targetStepId = null, action = 'click') => {
+    if (!navigationRunCompleted) return
+    setRightMode('viewer')
+    setPickerActive(true)
+    setPickerTargetStepId(targetStepId || (selectedStep?.type === CLICK_STEP_TYPE ? selectedStep.id : null))
+    setPickerAction(action)
+    const target = targetStepId ? steps.find((step) => step.id === targetStepId) : null
+    setPickerValue(target?.settings?.value || '')
+    setPickerTrial({ status: 'idle', selector: '', error: null, trialId: null })
+    setExecution((current) => ({ ...current, pickerElement: null, error: null }))
+  }
+  const beginActivityPicker = (action) => {
+    if (!navigationReadyToAddActivities) return
+    if (navigationRunCompleted) activatePicker(null, action)
+  }
+  const choosePickerSelector = (selector) => {
+    const value = String(selector || '').trim()
+    if (!value) return
+    setExecution((current) => ({ ...current, pickerElement: current.pickerElement ? { ...current.pickerElement, selectedSelector: value } : current.pickerElement }))
+    setPickerTrial({ status: 'idle', selector: value, error: null, trialId: null })
+  }
+  const repickElement = () => {
+    setExecution((current) => ({ ...current, pickerElement: null }))
+    setPickerTrial({ status: 'idle', selector: '', error: null, trialId: null })
+    setPickerActive(true)
+  }
+  const tryPickerSelector = async () => {
+    const selector = String(execution.pickerElement?.selectedSelector || execution.pickerElement?.selector || '').trim()
+    const browserRunId = execution.navigationRunId || execution.runId
+    if (!selector || !browserRunId) return
+    const trialId = makeKey('picker-trial')
+    setPickerTrial({ status: 'running', selector, error: null, trialId })
+    setPickerActive(false)
+    try {
+      await api(`/step-runs/${browserRunId}/input`, {
+        method: 'POST',
+        body: JSON.stringify(pickerAction === 'fill'
+          ? { type: 'selector_fill', selector, value: pickerValue, trial_id: trialId }
+          : { type: 'selector_click', selector, trial_id: trialId }),
+      })
+    } catch (reason) {
+      setPickerTrial({ status: 'failed', selector, error: reason.message, trialId })
+    }
+  }
+  const cancelPicker = () => {
+    setPickerActive(false)
+    setPickerTargetStepId(null)
+    setPickerAction('click')
+    setPickerValue('')
+    setPickerTrial({ status: 'idle', selector: '', error: null, trialId: null })
+    setExecution((current) => ({ ...current, pickerElement: null, error: null }))
+    setRightMode('viewer')
+  }
+  const confirmPickedActivity = () => {
+    const selector = execution.pickerElement?.selectedSelector || execution.pickerElement?.selector
+    if (!selector) return
+    const targetStep = steps.find((step) => step.id === pickerTargetStepId)
+    const targetType = pickerAction === 'fill' ? FILL_STEP_TYPE : CLICK_STEP_TYPE
+    const targetStepId = targetStep?.type === targetType
+      ? targetStep.id
+      : pickerAction === 'fill' ? addFillStep() : addClickStep()
+    updateStep(targetStepId, (current) => ({
+      ...current,
+      settings: { ...current.settings, selector, ...(pickerAction === 'fill' ? { value: pickerValue } : {}) },
+    }))
+    setPickerActive(false)
+    setPickerTargetStepId(null)
+    setPickerAction('click')
+    setPickerValue('')
+    setPickerTrial({ status: 'idle', selector: '', error: null, trialId: null })
+    setRightMode('editor')
   }
   return (
     <section className="studio-layout">
-      <aside className="studio-sidebar" onClick={showViewerFromBackground}>
+      <aside className="studio-sidebar">
         <div className="eyebrow">Studio</div>
         <div className="section-label">NEW PROJECT</div>
         <input aria-label="Project name" value={studio.projectName} onChange={(event) => updateStudio({ projectName: event.target.value })} placeholder="sui-dev" />
@@ -430,44 +600,105 @@ function StudioView({
         <div className="canvas-shell">
           <div className="palette">
             <div className="section-label">Blocks</div>
-            {steps.map((step, index) => (
+            {steps.map((step, index) => {
+              const stepLocked = index > 0 && !navigationRunCompleted
+              return (
               <div
-                className={selectedStepId === step.id ? 'step-list-item selected' : 'step-list-item'}
+                className={`${selectedStepId === step.id ? 'step-list-item selected' : 'step-list-item'}${stepLocked ? ' locked' : ''}`}
                 key={step.id}
                 role="button"
                 tabIndex="0"
                 onClick={(event) => {
+                  if (stepLocked) return
                   if (event.target.closest('.step-name')) selectStep(step.id)
                   else if (!event.target.closest('button')) setRightMode('viewer')
                 }}
-                onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') selectStep(step.id) }}
+                onKeyDown={(event) => { if (!stepLocked && (event.key === 'Enter' || event.key === ' ')) selectStep(step.id) }}
               >
                 <span className="step-number">{index + 1}</span>
-                <span className="step-name">Navigate to website</span>
-                <button className="step-play" aria-label="Run this step" onClick={(event) => { event.stopPropagation(); runStepLive(step) }}>▶</button>
+                <span className="step-name">{stepLabel(step)}</span>
+                <button className="step-play" aria-label="Run this step" disabled={stepLocked} onClick={(event) => { event.stopPropagation(); runStepLive(step) }}>▶</button>
               </div>
-            ))}
+              )
+            })}
             {!steps.length && <div className="empty-sidebar">No steps yet</div>}
             <button className="secondary-button add-button" onClick={() => setRightMode('picker')}>Add step</button>
           </div>
-          <div className="canvas" onClick={showViewerFromBackground}>
-            {rightMode === 'viewer' && <ExecutionViewer execution={execution} onInput={sendViewerInput} />}
+          <div className="canvas">
+            {rightMode === 'viewer' && (
+              <div className={pickerActive ? 'viewer-mode-shell picker-mode' : 'viewer-mode-shell'}>
+                {pickerActive && (
+                  <SelectorPicker
+                    execution={execution}
+                    pickerTrial={pickerTrial}
+                    pickerAction={pickerAction}
+                    pickerValue={pickerValue}
+                    onChooseSelector={choosePickerSelector}
+                    onChooseAction={(action) => { setPickerAction(action); setPickerTrial((current) => ({ ...current, status: 'idle', error: null, trialId: null })) }}
+                    onChangeValue={setPickerValue}
+                    onTrySelector={tryPickerSelector}
+                    onRepick={repickElement}
+                    onConfirm={confirmPickedActivity}
+                    onCancel={cancelPicker}
+                  />
+                )}
+                {!pickerActive && pickerTrial.status !== 'idle' && execution.pickerElement && (
+                  <div className="picker-review-bar">
+                    <button className="back-to-selectors" type="button" onClick={() => setPickerActive(true)}>BACK TO SELECTORS</button>
+                    <span>{pickerTrial.status === 'running' ? 'Running trial…' : pickerTrial.status === 'completed' ? 'Trial completed' : 'Trial failed'}</span>
+                  </div>
+                )}
+                {(!pickerActive || !execution.pickerElement) && (
+                  <ExecutionViewer
+                    execution={execution}
+                    onInput={sendViewerInput}
+                    pickerActive={pickerActive}
+                    pickerEnabled={navigationRunCompleted}
+                    onPickerToggle={() => activatePicker()}
+                  />
+                )}
+              </div>
+            )}
             {rightMode === 'picker' && (
               <div className="step-picker">
                 <button className="back-execution" onClick={() => setRightMode('viewer')}>← Back to execution</button>
                 <div className="section-label">Available activities</div>
-                <button className="picker-option" onClick={() => { addNavigationStep(); setRightMode('editor') }}>
+                <button className="picker-option" disabled={Boolean(steps.length && firstStep?.type !== STEP_TYPE)} onClick={() => { addNavigationStep(); setRightMode('editor') }}>
                   <span className="block-icon">↗</span><span>Navigate to website</span>
                 </button>
+                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => beginActivityPicker('click')} title={!navigationReadyToAddActivities ? 'Add a URL to the first Navigate to website step first' : 'Run the first Navigate to website step before picking an element'}>
+                  <span className="block-icon">+</span><span>Click</span>
+                </button>
+                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => beginActivityPicker('fill')} title="Run the first Navigate to website step before picking an element">
+                  <span className="block-icon">+</span><span>Fill</span>
+                </button>
+                <button className="back-to-view" type="button" onClick={() => setRightMode('viewer')}>BACK TO VIEW</button>
               </div>
             )}
             {rightMode === 'editor' && selectedStep && (
               <div className="step-detail">
-                <button className="back-execution" onClick={() => setRightMode('viewer')}>← Back to execution</button>
                 <div className="section-label">Selected step</div>
-                <h3>Navigate to website</h3>
-                <p className="detail-copy">Open this URL when the recipe runs.</p>
-                <label>URL<input value={selectedStep.settings?.url || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, url: event.target.value } }))} placeholder="https://example.com" /></label>
+                <div className="step-detail-heading"><h3>{stepLabel(selectedStep)}</h3><button className="step-delete" type="button" onClick={() => { deleteStep(selectedStep.id); setRightMode('viewer') }}>Delete step</button></div>
+                {selectedStep.type === CLICK_STEP_TYPE ? (
+                  <>
+                    <p className="detail-copy">Choose an element in the live browser. This step will click it by selector.</p>
+                    <label>Selector<input value={selectedStep.settings?.selector || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, selector: event.target.value } }))} placeholder="Pick an element in the TV" /></label>
+                    <button className="secondary-button picker-launch" disabled={!navigationRunCompleted} onClick={() => activatePicker(selectedStep.id, 'click')}>Pick element in TV</button>
+                  </>
+                ) : selectedStep.type === FILL_STEP_TYPE ? (
+                  <>
+                    <p className="detail-copy">Choose an element in the live browser and fill it with the value below.</p>
+                    <label>Selector<input value={selectedStep.settings?.selector || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, selector: event.target.value } }))} placeholder="Pick an element in the TV" /></label>
+                    <label>Value<input value={selectedStep.settings?.value || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, value: event.target.value } }))} placeholder="Text to fill" /></label>
+                    <button className="secondary-button picker-launch" disabled={!navigationRunCompleted} onClick={() => activatePicker(selectedStep.id, 'fill')}>Pick element in TV</button>
+                  </>
+                ) : (
+                  <>
+                    <p className="detail-copy">Open this URL when the recipe runs.</p>
+                    <label>URL<input value={selectedStep.settings?.url || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, url: event.target.value } }))} placeholder="https://example.com" /></label>
+                  </>
+                )}
+                <button className="back-to-view" type="button" onClick={() => setRightMode('viewer')}>BACK TO VIEW</button>
               </div>
             )}
           </div>
@@ -477,7 +708,63 @@ function StudioView({
   )
 }
 
-function ExecutionViewer({ execution, onInput }) {
+function SelectorPicker({ execution, pickerTrial, pickerAction, pickerValue, onChooseSelector, onChooseAction, onChangeValue, onTrySelector, onRepick, onConfirm, onCancel }) {
+  const element = execution.pickerElement
+  const candidates = (Array.isArray(element?.selectorCandidates) ? element.selectorCandidates : [])
+    .map((candidate) => typeof candidate === 'string' ? { selector: candidate, kind: 'Selector', unique: null, matches: null } : candidate)
+    .filter((candidate) => String(candidate?.selector || '').trim())
+  const selectedSelector = String(element?.selectedSelector || pickerTrial.selector || element?.selector || '').trim()
+  const trialRunning = pickerTrial.status === 'running'
+  const trialFinished = pickerTrial.status === 'completed' || pickerTrial.status === 'failed'
+  return (
+    <div className={element ? 'selector-picker-panel has-element' : 'selector-picker-panel'} onClick={(event) => event.stopPropagation()}>
+      <div className="selector-picker-toolbar">
+        <span className="section-label">Pick an element</span>
+        <div className="selector-picker-actions">
+          <button className={pickerAction === 'click' ? 'selector-action active' : 'selector-action'} type="button" onClick={() => onChooseAction('click')}>Click</button>
+          <button className={pickerAction === 'fill' ? 'selector-action active' : 'selector-action'} type="button" onClick={() => onChooseAction('fill')}>Fill</button>
+          <button className="selector-action" type="button" disabled title="Scrape is not supported yet">Scrape</button>
+        </div>
+      </div>
+      {!element ? (
+        <div className="selector-picker-empty" aria-hidden="true" />
+      ) : (
+        <>
+          <div className="selector-picker-element">
+            <strong>{element.metadata?.tag || 'Element'}{element.metadata?.text ? ` · ${element.metadata.text}` : ''}</strong>
+            <span>{element.metadata?.ariaLabel || element.metadata?.role || 'Choose a selector to try'}</span>
+          </div>
+          {pickerAction === 'fill' && <label className="picker-value-field">Value<input value={pickerValue} onChange={(event) => onChangeValue(event.target.value)} placeholder="Text to fill" /></label>}
+          <div className="selector-picker-list">
+            {candidates.map((candidate, index) => {
+              const selector = String(candidate.selector).trim()
+              const selected = selector === selectedSelector
+              const uniqueness = candidate.unique === true ? 'unique' : candidate.matches !== null && candidate.matches !== undefined ? `${candidate.matches} matches` : ''
+              return (
+                <button className={selected ? 'selector-candidate selected' : 'selector-candidate'} type="button" key={`${selector}-${index}`} onClick={() => onChooseSelector(selector)}>
+                  <span className="selector-candidate-meta"><strong>{candidate.kind || 'Selector'}</strong>{uniqueness && <small>{uniqueness}</small>}</span>
+                  <code>{selector}</code>
+                </button>
+              )
+            })}
+          </div>
+          {pickerTrial.error && <div className="selector-picker-error">{pickerTrial.error}</div>}
+          {pickerTrial.status === 'completed' && <div className="selector-picker-success">{pickerAction === 'fill' ? 'Fill completed with this selector.' : 'Click completed with this selector.'}</div>}
+          {trialFinished && <div className="selector-picker-confirm">Confirm this {pickerAction === 'fill' ? 'Fill' : 'Click'} step with the selected selector.</div>}
+          <div className="selector-picker-footer">
+            <button className="primary-button" type="button" disabled={!selectedSelector || trialRunning || (pickerAction === 'fill' && !pickerValue)} onClick={onTrySelector}>{trialRunning ? 'Trying…' : pickerAction === 'fill' ? 'Try Fill' : 'Try Click'}</button>
+            {trialFinished ? <button className="primary-button" type="button" disabled={!selectedSelector || trialRunning || (pickerAction === 'fill' && !pickerValue)} onClick={onConfirm}>Confirm</button> : null}
+            <button className="secondary-button" type="button" onClick={onRepick}>Repick</button>
+            <button className="secondary-button" type="button" onClick={onCancel}>Cancel</button>
+          </div>
+        </>
+      )}
+      {!element && <div className="selector-picker-footer"><button className="secondary-button" type="button" onClick={onCancel}>Cancel</button></div>}
+    </div>
+  )
+}
+
+function ExecutionViewer({ execution, onInput, pickerActive, pickerEnabled, onPickerToggle }) {
   const statusLabel = execution.status === 'idle' ? '' : execution.status === 'completed' ? 'Completed' : execution.status === 'failed' ? 'Failed' : 'Running'
   const handleKeyDown = (event) => {
     if (!onInput || !execution.runId) return
@@ -500,7 +787,7 @@ function ExecutionViewer({ execution, onInput }) {
     const renderedHeight = sourceHeight * scale
     const x = (event.clientX - rect.left - (rect.width - renderedWidth) / 2) / scale
     const y = (event.clientY - rect.top - (rect.height - renderedHeight) / 2) / scale
-    if (x >= 0 && y >= 0 && x <= sourceWidth && y <= sourceHeight) onInput({ type: 'click', x, y })
+    if (x >= 0 && y >= 0 && x <= sourceWidth && y <= sourceHeight) onInput({ type: pickerActive ? 'inspect' : 'click', x, y })
   }
   return (
     <div
@@ -508,8 +795,12 @@ function ExecutionViewer({ execution, onInput }) {
       tabIndex="0"
       onClick={(event) => event.currentTarget.focus()}
       onKeyDown={handleKeyDown}
-      title={execution.runId ? 'Click here and type into the live browser' : undefined}
     >
+      {pickerEnabled && !pickerActive && (
+        <button className={pickerActive ? 'picker-toggle active' : 'picker-toggle'} onClick={(event) => { event.stopPropagation(); onPickerToggle() }}>
+          {pickerActive ? 'Picker on' : 'Picker'}
+        </button>
+      )}
       {execution.frame ? <img src={execution.frame} alt="Live browser execution" onClick={handleImageClick} /> : <div className="viewer-mark">SUI</div>}
       {statusLabel && <span className={`viewer-status ${execution.status}`}>{statusLabel}</span>}
       {execution.error && <div className="viewer-error">{execution.error}</div>}
@@ -542,7 +833,7 @@ function ProjectsView({ projects, projectDetail, newProject, openProject, editPr
 }
 
 function RecipeCard({ recipe, runRecipe }) {
-  return <article className="recipe-card"><div><span className="card-kicker">Recipe</span><h2>{recipe.name}</h2><p>{recipe.definition?.steps?.length || 0} navigation step{recipe.definition?.steps?.length === 1 ? '' : 's'}</p></div><button className="secondary-button" onClick={() => runRecipe(recipe)}>Run recipe</button></article>
+  return <article className="recipe-card"><div><span className="card-kicker">Recipe</span><h2>{recipe.name}</h2><p>{recipe.definition?.steps?.length || 0} step{recipe.definition?.steps?.length === 1 ? '' : 's'}</p></div><button className="secondary-button" onClick={() => runRecipe(recipe)}>Run recipe</button></article>
 }
 
 function JobsView({ jobs, jobDetail, openJob, clearDetail }) {

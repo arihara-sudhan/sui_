@@ -22,8 +22,10 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "sui.db"
 GENERATED_DIR = DATA_DIR / "generated"
+CHROME_PROFILE_DIR = DATA_DIR / "chrome-profile"
 FRONTEND_DIST = ROOT / "frontend" / "dist"
 SCHEMA_VERSION = 1
+SUPPORTED_STEP_TYPES = {"navigate_to_website", "click", "fill"}
 STEP_RUNS: dict[str, dict[str, Any]] = {}
 STEP_RUNS_LOCK = threading.Lock()
 STEP_RUNS_CHANGED = threading.Condition(STEP_RUNS_LOCK)
@@ -114,25 +116,53 @@ def validate_url(value: Any) -> str:
     return url
 
 
+def validate_selector(value: Any) -> str:
+    selector = str(value or "").strip()
+    if not selector:
+        raise ValueError("Click requires a selector. Pick an element in the live browser first")
+    if selector.lower().startswith("javascript:"):
+        raise ValueError("JavaScript selectors are not supported")
+    return selector
+
+
 def normalize_definition(
-    definition: dict[str, Any], project_id: str, recipe_id: str, recipe_name: str, version: int
+    definition: dict[str, Any],
+    project_id: str,
+    recipe_id: str,
+    recipe_name: str,
+    version: int,
+    require_first_navigation: bool = True,
 ) -> dict[str, Any]:
     raw_steps = definition.get("steps", [])
     if not isinstance(raw_steps, list):
         raise ValueError("Recipe steps must be an array")
+    if require_first_navigation and raw_steps:
+        first_step = raw_steps[0]
+        if not isinstance(first_step, dict) or str(first_step.get("type") or "") != "navigate_to_website":
+            raise ValueError("The first recipe step must be Navigate to website")
     steps: list[dict[str, Any]] = []
     for index, raw_step in enumerate(raw_steps):
         if not isinstance(raw_step, dict):
             raise ValueError("Every recipe step must be an object")
-        if raw_step.get("type") != "navigate_to_website":
-            raise ValueError("Only Navigate to website is supported in this version")
+        step_type = str(raw_step.get("type") or "")
+        if step_type not in SUPPORTED_STEP_TYPES:
+            raise ValueError("Only Navigate to website, Click, and Fill are supported")
         settings = raw_step.get("settings") or {}
         position = raw_step.get("position") or {}
+        if step_type == "navigate_to_website":
+            normalized_settings = {"url": validate_url(settings.get("url"))}
+        elif step_type == "fill":
+            normalized_settings = {
+                "selector": validate_selector(settings.get("selector")),
+                "value": str(settings.get("value") or ""),
+            }
+        else:
+            normalized_settings = {"selector": validate_selector(settings.get("selector"))}
         steps.append(
             {
                 "id": str(raw_step.get("id") or f"step_{uuid.uuid4().hex[:12]}"),
-                "type": "navigate_to_website",
-                "settings": {"url": validate_url(settings.get("url"))},
+                "type": step_type,
+                "settings": normalized_settings,
                 "connections": raw_step.get("connections") or {"next": []},
                 "position": {
                     "x": int(position.get("x", 48 + index * 220)),
@@ -153,28 +183,88 @@ def normalize_definition(
 
 def generate_python(definition: dict[str, Any]) -> str:
     lines = [
+        "import os",
+        "import shutil",
+        "import socket",
+        "import subprocess",
+        "import tempfile",
+        "import time",
+        "import urllib.request",
         "from rustwright.sync_api import sync_playwright",
         "",
         "",
-        "def run():",
-        "    with sync_playwright() as playwright:",
-        "        browser = playwright.chromium.launch(headless=True)",
+        "def free_port():",
+        "    sock = socket.socket()",
+        "    sock.bind((\"127.0.0.1\", 0))",
+        "    port = sock.getsockname()[1]",
+        "    sock.close()",
+        "    return port",
+        "",
+        "",
+        "def wait_for_cdp(port):",
+        "    endpoint = f\"http://127.0.0.1:{port}/json/version\"",
+        "    for _ in range(100):",
         "        try:",
-        "            page = browser.new_page()",
+        "            urllib.request.urlopen(endpoint, timeout=1).close()",
+        "            return",
+        "        except OSError:",
+        "            time.sleep(0.1)",
+        "    raise RuntimeError(\"Chrome CDP endpoint did not start\")",
+        "",
+        "",
+        "def run():",
+        "    chrome_process = None",
+        "    profile_dir = None",
+        "    browser = None",
+        "    with sync_playwright() as playwright:",
+        "        chrome_candidates = [os.environ.get(\"SUI_CHROME_PATH\", \"\"), r\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\", r\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\"]",
+        "        chrome_path = next((candidate for candidate in chrome_candidates if candidate and os.path.exists(candidate)), shutil.which(\"chrome\"))",
+        "        if not chrome_path: raise RuntimeError(\"Installed Chrome executable not found. Set SUI_CHROME_PATH.\")",
+        "        port = free_port()",
+        "        profile_dir = tempfile.mkdtemp(prefix=\"sui-recipe-\")",
+        "        chrome_process = subprocess.Popen([chrome_path, \"--headless=new\", \"--disable-gpu\", \"--no-first-run\", \"--no-default-browser-check\", \"--window-size=1280,720\", f\"--remote-debugging-port={port}\", f\"--user-data-dir={profile_dir}\", \"about:blank\"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+        "        wait_for_cdp(port)",
+        "        browser = playwright.chromium.connect_over_cdp(f\"http://127.0.0.1:{port}\")",
+        "        context = browser.contexts[0]",
+        "        page = context.pages[0] if context.pages else context.new_page()",
+        "        try:",
     ]
     for step in definition["steps"]:
         # json.dumps creates a safe Python string literal; it is never executed as code.
-        url_literal = json.dumps(step["settings"]["url"])
-        lines.extend(
-            [
-                f"            page.goto({url_literal}, wait_until=\"domcontentloaded\")",
-                f"            print(\"Navigated: {step['id']}\")",
-            ]
-        )
+        if step["type"] == "navigate_to_website":
+            url_literal = json.dumps(step["settings"]["url"])
+            lines.extend(
+                [
+                    f"            page.goto({url_literal}, wait_until=\"domcontentloaded\")",
+                    f"            print(\"Navigated: {step['id']}\")",
+                ]
+            )
+        elif step["type"] == "fill":
+            selector_literal = json.dumps(step["settings"]["selector"])
+            value_literal = json.dumps(step["settings"].get("value", ""))
+            lines.extend(
+                [
+                    f"            page.locator({selector_literal}).first.fill({value_literal})",
+                    f"            print(\"Filled: {step['id']}\")",
+                ]
+            )
+        else:
+            selector_literal = json.dumps(step["settings"]["selector"])
+            lines.extend(
+                [
+                    f"            page.locator({selector_literal}).first.click()",
+                    f"            print(\"Clicked: {step['id']}\")",
+                ]
+            )
     lines.extend(
         [
-            "        finally:",
-            "            browser.close()",
+        "        finally:",
+        "            if browser: browser.close()",
+        "            if chrome_process and chrome_process.poll() is None:",
+        "                chrome_process.terminate()",
+        "                try: chrome_process.wait(timeout=5)",
+        "                except subprocess.TimeoutExpired: chrome_process.kill()",
+        "            if profile_dir: shutil.rmtree(profile_dir, ignore_errors=True)",
             "",
             "",
             "if __name__ == \"__main__\":",
@@ -187,14 +277,73 @@ def generate_python(definition: dict[str, Any]) -> str:
 
 def generate_step_python(definition: dict[str, Any]) -> str:
     step = definition["steps"][0]
-    url_literal = json.dumps(step["settings"]["url"])
+    if step["type"] == "navigate_to_website":
+        action_lines = [
+            f"            await page.goto({json.dumps(step['settings']['url'])}, wait_until=\"domcontentloaded\")",
+        ]
+        log_line = f"            print(\"SUI_LOG:Navigated: {step['id']}\", flush=True)"
+    elif step["type"] == "fill":
+        action_lines = [
+            f"            await page.locator({json.dumps(step['settings']['selector'])}).first.fill({json.dumps(step['settings'].get('value', ''))})",
+        ]
+        log_line = f"            print(\"SUI_LOG:Filled: {step['id']}\", flush=True)"
+    else:
+        action_lines = [
+            f"            await page.locator({json.dumps(step['settings']['selector'])}).first.click()",
+        ]
+        log_line = f"            print(\"SUI_LOG:Clicked: {step['id']}\", flush=True)"
     return "\n".join(
         [
             "import asyncio",
             "import base64",
+            "import ctypes",
             "import json",
+            "import os",
+            "import shutil",
+            "import socket",
+            "import subprocess",
+            "import tempfile",
+            "import time",
+            "import urllib.request",
             "import sys",
             "from rustwright.async_api import async_playwright",
+            "",
+            "",
+            "def free_port():",
+            "    sock = socket.socket()",
+            "    sock.bind((\"127.0.0.1\", 0))",
+            "    port = sock.getsockname()[1]",
+            "    sock.close()",
+            "    return port",
+            "",
+            "",
+            "def wait_for_cdp(port):",
+            "    endpoint = f\"http://127.0.0.1:{port}/json/version\"",
+            "    for _ in range(100):",
+            "        try:",
+            "            urllib.request.urlopen(endpoint, timeout=1).close()",
+            "            return",
+            "        except OSError:",
+            "            time.sleep(0.1)",
+            "    raise RuntimeError(\"Chrome CDP endpoint did not start\")",
+            "",
+            "",
+            "def maximize_window(process):",
+            "    if os.name != \"nt\": return",
+            "    user32 = ctypes.windll.user32",
+            "    target = ctypes.c_void_p()",
+            "    process_id = ctypes.c_ulong()",
+            "    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)",
+            "    def find_window(hwnd, _lparam):",
+            "        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))",
+            "        if process_id.value == process.pid and user32.IsWindowVisible(hwnd):",
+            "            target.value = hwnd",
+            "            return False",
+            "        return True",
+            "    user32.EnumWindows(callback_type(find_window), 0)",
+            "    if target.value:",
+            "        user32.ShowWindow(target, 3)",
+            "        user32.SetForegroundWindow(target)",
             "",
             "",
             "async def emit_frame(page):",
@@ -211,6 +360,50 @@ def generate_step_python(definition: dict[str, Any]) -> str:
             "        await asyncio.sleep(0.25)",
             "",
             "",
+            "async def inspect_at(page, x, y):",
+            "    return await page.evaluate(\"\"\"(point) => {",
+            "        const hovered = document.elementFromPoint(point.x, point.y);",
+            "        if (!hovered) return null;",
+            "        const target = hovered.closest('button,a,input,textarea,select,[role=button],[role=link]') || hovered;",
+            "        const escape = (value) => (window.CSS && CSS.escape ? CSS.escape(value) : value.replace(/[^a-zA-Z0-9_-]/g, '\\\\$&'));",
+            "        const parts = [];",
+            "        const targetClasses = Array.from(target.classList || []).filter(Boolean).slice(0, 2);",
+            "        let node = target;",
+            "        while (node && node.nodeType === 1 && node !== document.body) {",
+            "            let part = node.tagName.toLowerCase();",
+            "            if (node.id) { parts.unshift('#' + escape(node.id)); break; }",
+            "            const classes = Array.from(node.classList || []).filter(Boolean).slice(0, 2);",
+            "            if (classes.length) part += classes.map((name) => '.' + escape(name)).join('');",
+            "            const siblings = node.parentElement ? Array.from(node.parentElement.children).filter((item) => item.tagName === node.tagName) : [];",
+            "            if (siblings.length > 1) part += ':nth-of-type(' + (siblings.indexOf(node) + 1) + ')';",
+            "            parts.unshift(part);",
+            "            node = node.parentElement;",
+            "        }",
+            "        const selector = parts.join(' > ');",
+            "        const text = String(target.innerText || target.getAttribute('aria-label') || target.value || '').replace(/\\\\s+/g, ' ').trim().slice(0, 120);",
+            "        const candidates = [];",
+            "        const addCandidate = (kind, value) => {",
+            "            if (!value || candidates.some((candidate) => candidate.selector === value)) return;",
+            "            let matches = null;",
+            "            try { matches = document.querySelectorAll(value).length; } catch (_) {}",
+            "            candidates.push({ selector: value, kind, unique: matches === 1, matches });",
+            "        };",
+            "        if (target.id) addCandidate('ID', '#' + escape(target.id));",
+            "        const testId = target.getAttribute('data-testid');",
+            "        if (testId) addCandidate('Test ID', '[data-testid=\"' + escape(testId) + '\"]');",
+            "        const name = target.getAttribute('name');",
+            "        if (name) addCandidate('Name', '[name=\"' + escape(name) + '\"]');",
+            "        const ariaLabel = target.getAttribute('aria-label');",
+            "        if (ariaLabel) addCandidate('ARIA label', '[aria-label=\"' + escape(ariaLabel) + '\"]');",
+            "        const role = target.getAttribute('role');",
+            "        if (role) addCandidate('Role', '[role=\"' + escape(role) + '\"]');",
+            "        if (targetClasses.length) addCandidate('CSS', target.tagName.toLowerCase() + targetClasses.map((name) => '.' + escape(name)).join(''));",
+            "        addCandidate('Path', selector);",
+            "        const rect = target.getBoundingClientRect();",
+            "        return { selector: candidates[0]?.selector || selector, selectorCandidates: candidates, metadata: { tag: target.tagName.toLowerCase(), text, role: target.getAttribute('role') || '', ariaLabel: target.getAttribute('aria-label') || '' }, boundingRect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };",
+            "    }\"\"\", {\"x\": x, \"y\": y})",
+            "",
+            "",
             "async def command_loop(page):",
             "    while True:",
             "        line = await asyncio.to_thread(sys.stdin.readline)",
@@ -221,35 +414,60 @@ def generate_step_python(definition: dict[str, Any]) -> str:
             "        except json.JSONDecodeError:",
             "            continue",
             "        try:",
-            "            if command.get(\"type\") == \"text\":",
+            "            if command.get(\"type\") == \"navigate\":",
+            "                await page.goto(str(command.get(\"url\") or \"\"), wait_until=\"domcontentloaded\")",
+            "                print(\"SUI_ACTION_COMPLETE:\" + json.dumps({\"status\": \"completed\", \"action\": \"navigate\"}), flush=True)",
+            "            elif command.get(\"type\") == \"text\":",
             "                await page.keyboard.insert_text(str(command.get(\"text\", \"\")))",
             "            elif command.get(\"type\") == \"key\":",
             "                await page.keyboard.press(str(command.get(\"key\", \"\")))",
             "            elif command.get(\"type\") == \"click\":",
             "                await page.mouse.click(float(command.get(\"x\", 0)), float(command.get(\"y\", 0)))",
+            "            elif command.get(\"type\") == \"selector_fill\":",
+            "                await page.locator(str(command.get(\"selector\") or \"\")).first.fill(str(command.get(\"value\") or \"\"))",
+            "                print(\"SUI_ACTION_COMPLETE:\" + json.dumps({\"status\": \"completed\", \"action\": \"fill\", \"trial_id\": command.get(\"trial_id\")}), flush=True)",
+            "            elif command.get(\"type\") == \"selector_click\":",
+            "                await page.locator(str(command.get(\"selector\") or \"\")).first.click()",
+            "                print(\"SUI_ACTION_COMPLETE:\" + json.dumps({\"status\": \"completed\", \"action\": \"click\", \"trial_id\": command.get(\"trial_id\")}), flush=True)",
+            "            elif command.get(\"type\") == \"inspect\":",
+            "                try:",
+            "                    result = await inspect_at(page, float(command.get(\"x\", 0)), float(command.get(\"y\", 0)))",
+            "                    print(\"SUI_INSPECT:\" + json.dumps(result), flush=True)",
+            "                except Exception as exc:",
+            "                    print(\"SUI_INSPECT:\" + json.dumps({\"error\": str(exc)}), flush=True)",
             "            else:",
             "                continue",
             "            await emit_frame(page)",
-            "        except Exception:",
-            "            pass",
+            "        except Exception as exc:",
+            "            if command.get(\"type\") in {\"navigate\", \"selector_click\", \"selector_fill\"}:",
+            "                print(\"SUI_ACTION_COMPLETE:\" + json.dumps({\"status\": \"failed\", \"error\": str(exc), \"trial_id\": command.get(\"trial_id\")}), flush=True)",
             "",
             "",
             "async def run():",
+            "    chrome_process = None",
+            "    profile_dir = None",
+            "    browser = None",
             "    async with async_playwright() as playwright:",
-            "        browser = await playwright.chromium.launch(headless=True)",
-            "        page = await browser.new_page(viewport={\"width\": 1280, \"height\": 720})",
+            "        chrome_candidates = [os.environ.get(\"SUI_CHROME_PATH\", \"\"), r\"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\", r\"C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe\"]",
+            "        chrome_path = next((candidate for candidate in chrome_candidates if candidate and os.path.exists(candidate)), shutil.which(\"chrome\"))",
+            "        if not chrome_path: raise RuntimeError(\"Installed Chrome executable not found. Set SUI_CHROME_PATH.\")",
+            "        port = free_port()",
+            "        profile_dir = os.environ.get(\"SUI_CHROME_PROFILE_DIR\") or os.path.join(os.getcwd(), \"data\", \"chrome-profile\")",
+            "        os.makedirs(profile_dir, exist_ok=True)",
+            "        chrome_process = subprocess.Popen([chrome_path, \"--disable-features=IsolateOrigins,site-per-process\", \"--no-first-run\", \"--no-default-browser-check\", \"--start-maximized\", \"--window-position=0,0\", f\"--remote-debugging-port={port}\", f\"--user-data-dir={profile_dir}\", \"about:blank\"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+            "        await asyncio.to_thread(wait_for_cdp, port)",
+            "        maximize_window(chrome_process)",
+            "        browser = await playwright.chromium.connect_over_cdp(f\"http://127.0.0.1:{port}\")",
+            "        context = browser.contexts[0]",
+            "        page = context.pages[0] if context.pages else await context.new_page()",
             "        stop_event = asyncio.Event()",
             "        frame_task = None",
             "        command_task = None",
             "        try:",
+            *action_lines,
             "            await emit_frame(page)",
             "            frame_task = asyncio.create_task(stream_frames(page, stop_event))",
-            f"            await page.goto({url_literal}, wait_until=\"domcontentloaded\")",
-            "            stop_event.set()",
-            "            if frame_task:",
-            "                await frame_task",
-            "            await emit_frame(page)",
-            f"            print(\"SUI_LOG:Navigated: {step['id']}\", flush=True)",
+            log_line,
             "            print(\"SUI_READY\", flush=True)",
             "            command_task = asyncio.create_task(command_loop(page))",
             "            await asyncio.sleep(300)",
@@ -263,7 +481,11 @@ def generate_step_python(definition: dict[str, Any]) -> str:
             "                    await command_task",
             "                except asyncio.CancelledError:",
             "                    pass",
-            "            await browser.close()",
+            "            if browser: await browser.close()",
+            "            if chrome_process and chrome_process.poll() is None:",
+            "                chrome_process.terminate()",
+            "                try: chrome_process.wait(timeout=5)",
+            "                except subprocess.TimeoutExpired: chrome_process.kill()",
             "",
             "",
             "if __name__ == \"__main__\":",
@@ -394,6 +616,28 @@ def emit_step_event(run_id: str, event: dict[str, Any]) -> None:
         STEP_RUNS_CHANGED.notify_all()
 
 
+def active_browser_run() -> tuple[str, dict[str, Any]] | None:
+    with STEP_RUNS_CHANGED:
+        for run_id, run in reversed(list(STEP_RUNS.items())):
+            process = run.get("process")
+            if not run.get("done") and process and process.poll() is None and process.stdin:
+                return run_id, run
+    return None
+
+
+def send_browser_command(run_id: str, command: dict[str, Any]) -> None:
+    with STEP_RUNS_CHANGED:
+        run = STEP_RUNS.get(run_id)
+        process = run.get("process") if run else None
+        if not process or process.poll() is not None or not process.stdin:
+            raise RuntimeError("Browser session is no longer active")
+        try:
+            process.stdin.write(json.dumps(command) + "\n")
+            process.stdin.flush()
+        except (BrokenPipeError, OSError) as exc:
+            raise RuntimeError("Browser session is no longer active") from exc
+
+
 def run_step_worker(run_id: str, definition: dict[str, Any], script_path: Path) -> None:
     emit_step_event(run_id, {"type": "status", "status": "running"})
     completion_sent = False
@@ -420,6 +664,18 @@ def run_step_worker(run_id: str, definition: dict[str, Any], script_path: Path) 
                 )
             elif line.startswith("SUI_LOG:"):
                 emit_step_event(run_id, {"type": "log", "message": line.removeprefix("SUI_LOG:")})
+            elif line.startswith("SUI_INSPECT:"):
+                try:
+                    element = json.loads(line.removeprefix("SUI_INSPECT:"))
+                    emit_step_event(run_id, {"type": "inspect", "element": element})
+                except json.JSONDecodeError:
+                    emit_step_event(run_id, {"type": "log", "message": "Browser returned invalid picker data", "level": "error"})
+            elif line.startswith("SUI_ACTION_COMPLETE:"):
+                try:
+                    action = json.loads(line.removeprefix("SUI_ACTION_COMPLETE:"))
+                    emit_step_event(run_id, {"type": "action_complete", **action})
+                except json.JSONDecodeError:
+                    emit_step_event(run_id, {"type": "action_complete", "status": "failed", "error": "Browser returned invalid action data"})
             elif line == "SUI_READY":
                 completion_sent = True
                 emit_step_event(run_id, {"type": "complete", "status": "completed", "error": None})
@@ -449,10 +705,27 @@ def run_step_worker(run_id: str, definition: dict[str, Any], script_path: Path) 
 
 
 def start_step_run(step: dict[str, Any]) -> str:
-    definition = normalize_definition({"steps": [step]}, "step-run", "step-run", "step-run", 1)
+    definition = normalize_definition(
+        {"steps": [step]}, "step-run", "step-run", "step-run", 1, require_first_navigation=False
+    )
+    normalized_step = definition["steps"][0]
+    active = active_browser_run()
+    if active:
+        active_run_id, _ = active
+        command = (
+            {"type": "navigate", "url": normalized_step["settings"]["url"]}
+            if normalized_step["type"] == "navigate_to_website"
+            else {"type": "selector_click", "selector": normalized_step["settings"]["selector"]}
+        )
+        try:
+            send_browser_command(active_run_id, command)
+            return active_run_id
+        except RuntimeError:
+            pass
     run_id = make_id("step_run")
     script_path = Path(tempfile.gettempdir()) / f"sui-{run_id}.py"
     script_path.write_text(generate_step_python(definition), encoding="utf-8")
+    CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
     with STEP_RUNS_CHANGED:
         STEP_RUNS[run_id] = {"events": [], "done": False}
     threading.Thread(target=run_step_worker, args=(run_id, definition, script_path), daemon=True).start()
@@ -476,13 +749,23 @@ def run_job(job_id: str) -> None:
             return
         connection.execute("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?", (now_iso(), job_id))
         version = connection.execute(
-            "SELECT generated_path FROM recipe_versions WHERE recipe_id = ? AND version = ?",
+            "SELECT generated_path, definition_json FROM recipe_versions WHERE recipe_id = ? AND version = ?",
             (job["recipe_id"], job["recipe_version"]),
         ).fetchone()
     add_job_log(job_id, "info", f"Running recipe version v{job['recipe_version']}")
     if not version:
         return finish_job(job_id, "failed", "Generated recipe version was not found")
-    code, stdout, stderr = execute_generated(ROOT / version["generated_path"])
+    generated_file = ROOT / version["generated_path"]
+    try:
+        # Recipe JSON is the source of truth. Refresh the existing version's
+        # generated file so recipes saved before a generator fix use the same
+        # current Rustwright/Chrome execution path without creating a version.
+        definition = json.loads(version["definition_json"])
+        generated_file.parent.mkdir(parents=True, exist_ok=True)
+        generated_file.write_text(generate_python(definition), encoding="utf-8")
+    except (OSError, TypeError, json.JSONDecodeError) as exc:
+        return finish_job(job_id, "failed", f"Unable to prepare generated recipe: {exc}")
+    code, stdout, stderr = execute_generated(generated_file)
     for line in stdout:
         add_job_log(job_id, "info", line)
     for line in stderr:
@@ -619,26 +902,27 @@ class SuiHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/step-runs/") and path.endswith("/input"):
                 run_id = path.split("/")[3]
                 command_type = str(body.get("type") or "")
-                if command_type not in {"text", "key", "click"}:
+                if command_type not in {"navigate", "text", "key", "click", "selector_click", "selector_fill", "inspect"}:
                     raise ValueError("Unsupported browser input type")
                 command = {"type": command_type}
-                if command_type == "text":
+                if command_type == "navigate":
+                    command["url"] = validate_url(body.get("url"))
+                elif command_type == "text":
                     command["text"] = str(body.get("text") or "")
                 elif command_type == "key":
                     command["key"] = str(body.get("key") or "")
+                elif command_type in {"selector_click", "selector_fill"}:
+                    command["selector"] = validate_selector(body.get("selector"))
+                    command["trial_id"] = str(body.get("trial_id") or "")
+                    if command_type == "selector_fill":
+                        command["value"] = str(body.get("value") or "")
                 else:
                     command["x"] = float(body.get("x", 0))
                     command["y"] = float(body.get("y", 0))
-                with STEP_RUNS_CHANGED:
-                    run = STEP_RUNS.get(run_id)
-                    process = run.get("process") if run else None
-                if not process or process.poll() is not None or not process.stdin:
-                    return self.send_error_payload("Browser session is no longer active", HTTPStatus.CONFLICT)
                 try:
-                    process.stdin.write(json.dumps(command) + "\n")
-                    process.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    return self.send_error_payload("Browser session is no longer active", HTTPStatus.CONFLICT)
+                    send_browser_command(run_id, command)
+                except RuntimeError as exc:
+                    return self.send_error_payload(str(exc), HTTPStatus.CONFLICT)
                 return self.send_payload({"ok": True})
             if path == "/api/step-runs":
                 step = body.get("step") or {}
