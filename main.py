@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import tempfile
 import uuid
 import base64
 from datetime import datetime, timezone
@@ -189,30 +190,84 @@ def generate_step_python(definition: dict[str, Any]) -> str:
     url_literal = json.dumps(step["settings"]["url"])
     return "\n".join(
         [
+            "import asyncio",
             "import base64",
-            "from rustwright.sync_api import sync_playwright",
+            "import json",
+            "import sys",
+            "from rustwright.async_api import async_playwright",
             "",
             "",
-            "def emit_frame(page):",
-            "    frame = page.screenshot(type=\"jpeg\", quality=70)",
+            "async def emit_frame(page):",
+            "    frame = await page.screenshot(type=\"jpeg\", quality=70)",
             "    print(\"SUI_FRAME:\" + base64.b64encode(frame).decode(\"ascii\"), flush=True)",
             "",
             "",
-            "def run():",
-            "    with sync_playwright() as playwright:",
-            "        browser = playwright.chromium.launch(headless=True)",
+            "async def stream_frames(page, stop_event):",
+            "    while not stop_event.is_set():",
             "        try:",
-            "            page = browser.new_page(viewport={\"width\": 1280, \"height\": 720})",
-            "            emit_frame(page)",
-            f"            page.goto({url_literal}, wait_until=\"domcontentloaded\")",
-            "            emit_frame(page)",
+            "            await emit_frame(page)",
+            "        except Exception:",
+            "            pass",
+            "        await asyncio.sleep(0.25)",
+            "",
+            "",
+            "async def command_loop(page):",
+            "    while True:",
+            "        line = await asyncio.to_thread(sys.stdin.readline)",
+            "        if not line:",
+            "            return",
+            "        try:",
+            "            command = json.loads(line)",
+            "        except json.JSONDecodeError:",
+            "            continue",
+            "        try:",
+            "            if command.get(\"type\") == \"text\":",
+            "                await page.keyboard.insert_text(str(command.get(\"text\", \"\")))",
+            "            elif command.get(\"type\") == \"key\":",
+            "                await page.keyboard.press(str(command.get(\"key\", \"\")))",
+            "            elif command.get(\"type\") == \"click\":",
+            "                await page.mouse.click(float(command.get(\"x\", 0)), float(command.get(\"y\", 0)))",
+            "            else:",
+            "                continue",
+            "            await emit_frame(page)",
+            "        except Exception:",
+            "            pass",
+            "",
+            "",
+            "async def run():",
+            "    async with async_playwright() as playwright:",
+            "        browser = await playwright.chromium.launch(headless=True)",
+            "        page = await browser.new_page(viewport={\"width\": 1280, \"height\": 720})",
+            "        stop_event = asyncio.Event()",
+            "        frame_task = None",
+            "        command_task = None",
+            "        try:",
+            "            await emit_frame(page)",
+            "            frame_task = asyncio.create_task(stream_frames(page, stop_event))",
+            f"            await page.goto({url_literal}, wait_until=\"domcontentloaded\")",
+            "            stop_event.set()",
+            "            if frame_task:",
+            "                await frame_task",
+            "            await emit_frame(page)",
             f"            print(\"SUI_LOG:Navigated: {step['id']}\", flush=True)",
+            "            print(\"SUI_READY\", flush=True)",
+            "            command_task = asyncio.create_task(command_loop(page))",
+            "            await asyncio.sleep(300)",
             "        finally:",
-            "            browser.close()",
+            "            stop_event.set()",
+            "            if frame_task:",
+            "                await frame_task",
+            "            if command_task:",
+            "                command_task.cancel()",
+            "                try:",
+            "                    await command_task",
+            "                except asyncio.CancelledError:",
+            "                    pass",
+            "            await browser.close()",
             "",
             "",
             "if __name__ == \"__main__\":",
-            "    run()",
+            "    asyncio.run(run())",
             "",
         ]
     )
@@ -341,15 +396,20 @@ def emit_step_event(run_id: str, event: dict[str, Any]) -> None:
 
 def run_step_worker(run_id: str, definition: dict[str, Any], script_path: Path) -> None:
     emit_step_event(run_id, {"type": "status", "status": "running"})
+    completion_sent = False
     try:
         process = subprocess.Popen(
             [sys.executable, "-u", str(script_path)],
             cwd=ROOT,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
+        with STEP_RUNS_CHANGED:
+            if run_id in STEP_RUNS:
+                STEP_RUNS[run_id]["process"] = process
         assert process.stdout is not None
         for raw_line in process.stdout:
             line = raw_line.strip()
@@ -360,22 +420,30 @@ def run_step_worker(run_id: str, definition: dict[str, Any], script_path: Path) 
                 )
             elif line.startswith("SUI_LOG:"):
                 emit_step_event(run_id, {"type": "log", "message": line.removeprefix("SUI_LOG:")})
+            elif line == "SUI_READY":
+                completion_sent = True
+                emit_step_event(run_id, {"type": "complete", "status": "completed", "error": None})
         stderr = process.stderr.read() if process.stderr else ""
         return_code = process.wait()
-        if stderr:
-            for line in stderr.splitlines():
-                if line.strip():
-                    emit_step_event(run_id, {"type": "log", "message": line.strip(), "level": "error"})
+        stderr_lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+        for line in stderr_lines:
+            emit_step_event(run_id, {"type": "log", "message": line, "level": "error"})
         status = "completed" if return_code == 0 else "failed"
-        emit_step_event(
-            run_id,
-            {"type": "complete", "status": status, "error": None if return_code == 0 else f"Browser step exited with code {return_code}"},
-        )
+        error = None
+        if return_code != 0:
+            error = stderr_lines[-1] if stderr_lines else f"Browser step exited with code {return_code}"
+        if not completion_sent or return_code != 0:
+            emit_step_event(run_id, {"type": "complete", "status": status, "error": error})
     except OSError as exc:
         emit_step_event(run_id, {"type": "complete", "status": "failed", "error": str(exc)})
     finally:
+        try:
+            script_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         with STEP_RUNS_CHANGED:
             if run_id in STEP_RUNS:
+                STEP_RUNS[run_id]["process"] = None
                 STEP_RUNS[run_id]["done"] = True
             STEP_RUNS_CHANGED.notify_all()
 
@@ -383,8 +451,7 @@ def run_step_worker(run_id: str, definition: dict[str, Any], script_path: Path) 
 def start_step_run(step: dict[str, Any]) -> str:
     definition = normalize_definition({"steps": [step]}, "step-run", "step-run", "step-run", 1)
     run_id = make_id("step_run")
-    script_path = GENERATED_DIR / "_step_runs" / f"{run_id}.py"
-    script_path.parent.mkdir(parents=True, exist_ok=True)
+    script_path = Path(tempfile.gettempdir()) / f"sui-{run_id}.py"
     script_path.write_text(generate_step_python(definition), encoding="utf-8")
     with STEP_RUNS_CHANGED:
         STEP_RUNS[run_id] = {"events": [], "done": False}
@@ -549,6 +616,30 @@ class SuiHandler(BaseHTTPRequestHandler):
                 return self.send_payload(saved, HTTPStatus.CREATED)
             if path.startswith("/api/recipes/") and path.endswith("/run"):
                 return self.send_payload(create_job(path.split("/")[3]), HTTPStatus.ACCEPTED)
+            if path.startswith("/api/step-runs/") and path.endswith("/input"):
+                run_id = path.split("/")[3]
+                command_type = str(body.get("type") or "")
+                if command_type not in {"text", "key", "click"}:
+                    raise ValueError("Unsupported browser input type")
+                command = {"type": command_type}
+                if command_type == "text":
+                    command["text"] = str(body.get("text") or "")
+                elif command_type == "key":
+                    command["key"] = str(body.get("key") or "")
+                else:
+                    command["x"] = float(body.get("x", 0))
+                    command["y"] = float(body.get("y", 0))
+                with STEP_RUNS_CHANGED:
+                    run = STEP_RUNS.get(run_id)
+                    process = run.get("process") if run else None
+                if not process or process.poll() is not None or not process.stdin:
+                    return self.send_error_payload("Browser session is no longer active", HTTPStatus.CONFLICT)
+                try:
+                    process.stdin.write(json.dumps(command) + "\n")
+                    process.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    return self.send_error_payload("Browser session is no longer active", HTTPStatus.CONFLICT)
+                return self.send_payload({"ok": True})
             if path == "/api/step-runs":
                 step = body.get("step") or {}
                 run_id = start_step_run(step)

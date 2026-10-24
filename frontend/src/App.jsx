@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 
 const STEP_TYPE = 'navigate_to_website'
 const API_ROOT = 'http://127.0.0.1:8000/api'
@@ -25,10 +25,15 @@ const blankStudio = () => ({
 })
 
 const api = async (path, options = {}) => {
-  const response = await fetch(`${API_ROOT}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-    ...options,
-  })
+  let response
+  try {
+    response = await fetch(`${API_ROOT}${path}`, {
+      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+      ...options,
+    })
+  } catch {
+    throw new Error('Sui backend is offline. Start it with: python main.py')
+  }
   const body = await response.json().catch(() => ({}))
   if (!response.ok) throw new Error(body.error || `Request failed (${response.status})`)
   return body
@@ -257,7 +262,7 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${view}-view`}>
       <header className="topbar">
         <button className="wordmark" onClick={() => changeView('studio')} aria-label="Open Studio">
           <img className="wordmark-logo" src="/logo.png" alt="Sui" />
@@ -317,21 +322,33 @@ function StudioView({
   const [editingRecipeKey, setEditingRecipeKey] = useState(null)
   const [rightMode, setRightMode] = useState('viewer')
   const [execution, setExecution] = useState({ status: 'idle', frame: null, logs: [], error: null })
+  const inputQueueRef = useRef(Promise.resolve())
   const steps = activeRecipe?.definition.steps || []
   const selectedStep = steps.find((step) => step.id === selectedStepId)
 
   const runStepLive = async (step) => {
     setRightMode('viewer')
-    setExecution({ status: 'running', frame: null, logs: [], error: null })
+    setExecution({ status: 'running', frame: null, logs: [], error: null, runId: null })
     try {
-      const startResponse = await fetch(`${API_ROOT}/step-runs`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step }),
-      })
+      let startResponse
+      try {
+        startResponse = await fetch(`${API_ROOT}/step-runs`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ step }),
+        })
+      } catch {
+        throw new Error('Sui backend is offline. Start it with: python main.py')
+      }
       const started = await startResponse.json()
       if (!startResponse.ok) throw new Error(started.error || 'Unable to start step')
-      const eventResponse = await fetch(`${API_ROOT}/step-runs/${started.run_id}/events`)
+      setExecution((current) => ({ ...current, runId: started.run_id }))
+      let eventResponse
+      try {
+        eventResponse = await fetch(`${API_ROOT}/step-runs/${started.run_id}/events`)
+      } catch {
+        throw new Error('Sui backend is offline. Start it with: python main.py')
+      }
       if (!eventResponse.ok || !eventResponse.body) throw new Error('Unable to connect to execution stream')
       const reader = eventResponse.body.getReader()
       const decoder = new TextDecoder()
@@ -357,16 +374,29 @@ function StudioView({
     }
   }
 
+  const sendViewerInput = (payload) => {
+    if (!execution.runId) return
+    inputQueueRef.current = inputQueueRef.current
+      .then(() => api(`/step-runs/${execution.runId}/input`, {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }))
+      .catch((reason) => setExecution((current) => ({ ...current, error: reason.message })))
+  }
+
   const selectStep = (stepId) => {
     setSelectedStepId(stepId)
     setRightMode('editor')
   }
+  const showViewerFromBackground = (event) => {
+    if (!event.target.closest('button, input, textarea, select, a, .step-name')) setRightMode('viewer')
+  }
   return (
     <section className="studio-layout">
-      <aside className="studio-sidebar">
+      <aside className="studio-sidebar" onClick={showViewerFromBackground}>
         <div className="eyebrow">Studio</div>
-        <h1>{studio.projectId ? 'Edit project' : 'New project'}</h1>
-        <label>Project name<input value={studio.projectName} onChange={(event) => updateStudio({ projectName: event.target.value })} placeholder="sui-dev" /></label>
+        <div className="section-label">NEW PROJECT</div>
+        <input aria-label="Project name" value={studio.projectName} onChange={(event) => updateStudio({ projectName: event.target.value })} placeholder="sui-dev" />
         <div className="section-label">Recipes</div>
         {studio.recipes.map((recipe, index) => (
           <div className={recipe.localKey === activeRecipeKey ? 'recipe-row active' : 'recipe-row'} key={recipe.localKey} onClick={() => { setActiveRecipeKey(recipe.localKey); setSelectedStepId(null); setRightMode('viewer') }}>
@@ -406,18 +436,22 @@ function StudioView({
                 key={step.id}
                 role="button"
                 tabIndex="0"
-                onClick={() => selectStep(step.id)}
+                onClick={(event) => {
+                  if (event.target.closest('.step-name')) selectStep(step.id)
+                  else if (!event.target.closest('button')) setRightMode('viewer')
+                }}
+                onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') selectStep(step.id) }}
               >
                 <span className="step-number">{index + 1}</span>
-                <span>Navigate to website</span>
+                <span className="step-name">Navigate to website</span>
                 <button className="step-play" aria-label="Run this step" onClick={(event) => { event.stopPropagation(); runStepLive(step) }}>▶</button>
               </div>
             ))}
             {!steps.length && <div className="empty-sidebar">No steps yet</div>}
             <button className="secondary-button add-button" onClick={() => setRightMode('picker')}>Add step</button>
           </div>
-          <div className="canvas">
-            {rightMode === 'viewer' && <ExecutionViewer execution={execution} />}
+          <div className="canvas" onClick={showViewerFromBackground}>
+            {rightMode === 'viewer' && <ExecutionViewer execution={execution} onInput={sendViewerInput} />}
             {rightMode === 'picker' && (
               <div className="step-picker">
                 <button className="back-execution" onClick={() => setRightMode('viewer')}>← Back to execution</button>
@@ -443,11 +477,40 @@ function StudioView({
   )
 }
 
-function ExecutionViewer({ execution }) {
+function ExecutionViewer({ execution, onInput }) {
   const statusLabel = execution.status === 'idle' ? '' : execution.status === 'completed' ? 'Completed' : execution.status === 'failed' ? 'Failed' : 'Running'
+  const handleKeyDown = (event) => {
+    if (!onInput || !execution.runId) return
+    if (event.key.length === 1) {
+      event.preventDefault()
+      onInput({ type: 'text', text: event.key })
+    } else if (['Enter', 'Tab', 'Backspace', 'Delete', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) {
+      event.preventDefault()
+      onInput({ type: 'key', key: event.key })
+    }
+  }
+  const handleImageClick = (event) => {
+    if (!onInput || !execution.runId) return
+    const image = event.currentTarget
+    const rect = image.getBoundingClientRect()
+    const sourceWidth = image.naturalWidth || 1280
+    const sourceHeight = image.naturalHeight || 720
+    const scale = Math.min(rect.width / sourceWidth, rect.height / sourceHeight)
+    const renderedWidth = sourceWidth * scale
+    const renderedHeight = sourceHeight * scale
+    const x = (event.clientX - rect.left - (rect.width - renderedWidth) / 2) / scale
+    const y = (event.clientY - rect.top - (rect.height - renderedHeight) / 2) / scale
+    if (x >= 0 && y >= 0 && x <= sourceWidth && y <= sourceHeight) onInput({ type: 'click', x, y })
+  }
   return (
-    <div className={execution.frame ? 'execution-viewer has-frame' : 'execution-viewer'}>
-      {execution.frame ? <img src={execution.frame} alt="Live browser execution" /> : <div className="viewer-mark">SUI</div>}
+    <div
+      className={execution.frame ? 'execution-viewer has-frame' : 'execution-viewer'}
+      tabIndex="0"
+      onClick={(event) => event.currentTarget.focus()}
+      onKeyDown={handleKeyDown}
+      title={execution.runId ? 'Click here and type into the live browser' : undefined}
+    >
+      {execution.frame ? <img src={execution.frame} alt="Live browser execution" onClick={handleImageClick} /> : <div className="viewer-mark">SUI</div>}
       {statusLabel && <span className={`viewer-status ${execution.status}`}>{statusLabel}</span>}
       {execution.error && <div className="viewer-error">{execution.error}</div>}
     </div>

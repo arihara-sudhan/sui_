@@ -35,7 +35,7 @@ h2 { font-size: 1.2rem; letter-spacing: -.025em; }
 label { display: grid; gap: 8px; color: #68736c; font-size: .78rem; font-weight: 650; }
 input { width: 100%; border: 1px solid #dce2dd; border-radius: 8px; background: #fff; color: #17201d; padding: 10px 11px; outline: none; }
 input:focus { border-color: #ff5b35; box-shadow: 0 0 0 3px #ff5b3520; }
-.studio-sidebar > label { margin-bottom: 28px; }
+.studio-sidebar > input { margin-bottom: 28px; }
 .section-label { margin-bottom: 10px; }
 .recipe-row { display: flex; align-items: center; gap: 6px; min-height: 38px; margin-bottom: 8px; padding: 4px 5px 4px 10px; border: 1px solid transparent; border-radius: 8px; color: #3d4a42; }
 .recipe-row.active { border-color: #ffb6a5; background: #fff7f4; }
@@ -55,9 +55,11 @@ input:focus { border-color: #ff5b35; box-shadow: 0 0 0 3px #ff5b3520; }
 .secondary-button:disabled, .primary-button:disabled { cursor: not-allowed; opacity: .45; }
 
 .workspace-heading, .section-heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; }
+.studio-workspace { min-width: 0; overflow: hidden; }
 .workspace-heading h2 { margin-top: 9px; font-size: 1.75rem; }
 .canvas-shell { display: grid; grid-template-columns: 190px minmax(0, 1fr); margin-top: 0; border: 1px solid #e5e9e5; border-radius: 14px; overflow: hidden; min-height: 570px; }
-.palette { padding: 20px 16px; border-right: 1px solid #e5e9e5; background: #fbfcfb; }
+.palette { max-height: 570px; overflow-y: auto; scrollbar-width: none; padding: 20px 16px; border-right: 1px solid #e5e9e5; background: #fbfcfb; }
+.palette::-webkit-scrollbar { display: none; }
 .block-icon { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 6px; background: #ff5b35; color: white; font-size: 1rem; }
 .add-button { width: 100%; margin-top: 14px; }
 .steps-label { margin-top: 25px; }
@@ -66,7 +68,7 @@ input:focus { border-color: #ff5b35; box-shadow: 0 0 0 3px #ff5b3520; }
 .step-list-item .step-number { flex: 0 0 auto; width: 19px; height: 19px; font-size: .65rem; }
 .step-play { margin-left: auto; border: 0; background: transparent; color: #ff5b35; padding: 3px 4px; font-size: .72rem; line-height: 1; }
 .step-play:hover { border-radius: 5px; background: #ffe4dc; }
-.canvas { position: relative; min-height: 570px; overflow: auto; padding: 28px; background: #fff; }
+.canvas { position: relative; height: 570px; min-height: 570px; overflow: hidden; padding: 28px; background: #fff; }
 .right-empty { color: #a7b0aa; font-size: .86rem; }
 .step-picker { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); align-content: start; gap: 12px; width: 100%; }
 .step-picker .section-label { grid-column: 1 / -1; }
@@ -78,6 +80,7 @@ input:focus { border-color: #ff5b35; box-shadow: 0 0 0 3px #ff5b3520; }
 .step-detail h3 { margin: 7px 0 6px; color: #27352d; font-size: 1rem; }
 .detail-copy { margin-bottom: 17px; color: #89948d; font-size: .78rem; line-height: 1.45; }
 .execution-viewer { position: relative; display: grid; place-items: center; min-height: 514px; width: calc(100% + 56px); margin: -28px; overflow: hidden; background: #ff5b35; }
+.execution-viewer:focus { outline: 3px solid #ffb6a5; outline-offset: -3px; }
 .execution-viewer.has-frame { background: #18201b; }
 .execution-viewer img { display: block; width: 100%; height: 100%; min-height: 514px; object-fit: contain; }
 .viewer-mark { color: #fff; font-size: clamp(3rem, 10vw, 7rem); font-weight: 850; letter-spacing: -.08em; }
@@ -87,6 +90,17 @@ input:focus { border-color: #ff5b35; box-shadow: 0 0 0 3px #ff5b3520; }
 .viewer-status.failed { color: #b42318; }
 .viewer-error { position: absolute; right: 16px; bottom: 52px; max-width: 360px; border-radius: 7px; background: #fff0f0; color: #b42318; padding: 8px 10px; font-size: .72rem; }
 .step-number { display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: #ff5b35; color: #fff; font-size: .7rem; }
+
+@media (min-width: 821px) {
+  .app-shell.studio-view { height: 100vh; overflow: hidden; }
+  .app-shell.studio-view .main-content { height: calc(100vh - 76px); overflow: hidden; padding-bottom: 0; }
+  .app-shell.studio-view .studio-layout { height: 100%; min-height: 0; }
+  .app-shell.studio-view .canvas-shell { height: 100%; min-height: 0; }
+  .app-shell.studio-view .palette { height: 100%; max-height: none; }
+  .app-shell.studio-view .canvas { height: 100%; min-height: 0; }
+  .app-shell.studio-view .execution-viewer { height: 100%; min-height: 0; }
+  .app-shell.studio-view .execution-viewer img { min-height: 0; }
+}
 
 .page-section { max-width: 1080px; margin: 0 auto; }
 .section-heading { margin: 14px 0 34px; }
