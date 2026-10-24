@@ -1,0 +1,27 @@
+version = 1
+revision = 2
+requires-python = ">=3.13"
+
+[[package]]
+name = "rustwright"
+version = "0.3.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1f/e3/2436454e6811760fc9db6149465348fcbd4f775258c146743ccf5063d25a/rustwright-0.3.0.tar.gz", hash = "sha256:be74d806f29310abc5c96c8219b70a08854baaa4d1c852ce890260679d7a92d5", size = 4497521, upload-time = "2026-08-24T00:49:00.638Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2f/b3/a58c00a908ce2e25ca4ecfedbd15cf5970eb7180c141e515f0c664721a06/rustwright-0.3.0-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:2b64e59bf32c08bbeb286f4aa8a3c50c57ddbb3a42d96d86b1a4fc37c012f2fc", size = 3504715, upload-time = "2026-08-24T00:48:49.816Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/65/85694f745b2c7558bdf286e1a47d9d9eebe19463d1f03d72a2b5a5183f81/rustwright-0.3.0-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:c3cc4579e22be68c578b2bfd335030f7b1e7a49248ddd0887793f81b752a1946", size = 3350136, upload-time = "2026-08-24T00:48:52.255Z" },
+    { url = "https://files.pythonhosted.org/packages/bf/60/d45c3c321013eb120d2cb2371043afccc6a063fec3dc1440681e67894121/rustwright-0.3.0-cp38-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:01d04e7b85e48bf76053afdf9392fc8b5c902483581fb726c05347048e00bc74", size = 3435139, upload-time = "2026-08-24T00:48:54.334Z" },
+    { url = "https://files.pythonhosted.org/packages/6f/34/295c595979877f60feba9e92c43d83202be09189c371101465347b4ddb73/rustwright-0.3.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:5c026d4e3789382fae009a5c96ec708351fc45e41f672529722ca9e1ce5fe142", size = 3621357, upload-time = "2026-08-24T00:48:56.06Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/20/fa6eee05ca1d1147304bc875c0c902298bcead3ebf432734c0b805e096f1/rustwright-0.3.0-cp38-abi3-win_amd64.whl", hash = "sha256:818031c88a41db6c3148a94a3d12151cd5053cec3d17cff181b09f1c0f541087", size = 4042645, upload-time = "2026-08-24T00:48:58.36Z" },
+]
+
+[[package]]
+name = "sui"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "rustwright" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "rustwright", specifier = ">=0.3.0" }]
