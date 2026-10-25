@@ -1,8 +1,11 @@
 import ast
+import difflib
 import json
 import os
+import re
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -313,9 +316,11 @@ class GeneratorRegressionTests(unittest.TestCase):
         self.assertEqual(settings["table_name"], "events")
         self.assertEqual([column["name"] for column in settings["columns"]], ["organizer", "event_count"])
         self.assertEqual(settings["columns"][0]["value"], '{varOne + "Organizer: " + varTwo}')
+        self.assertFalse(settings["semantic_duplicate_removal"])
         for source in (main.generate_python(normalized), main.generate_step_python(normalized)):
             ast.parse(source)
             self.assertIn("write_values_to_sqlite", source)
+            self.assertIn("semantic_row_similarity", source)
             self.assertIn("CREATE TABLE IF NOT EXISTS", source)
             self.assertIn("INSERT INTO", source)
             self.assertIn("evaluate_value_expression", source)
@@ -343,6 +348,28 @@ class GeneratorRegressionTests(unittest.TestCase):
             self.assertEqual(rows, [("Rasa Organizer: New York", 2), ("Second row", 3)])
             self.assertIn("source", {row[1] for row in columns})
 
+            update = namespace["write_values_to_sqlite"]("events", [
+                {"name": "organizer", "type": "TEXT", "value": "Updated organizer", "write": True},
+                {"name": "event_count", "type": "INTEGER", "value": "", "write": True},
+            ], False, 0.88, {"__sui_table": "events", "__sui_rowid": 1})
+            self.assertTrue(update["updated"])
+            connection = sqlite3.connect(Path(directory) / "writer.db")
+            try:
+                updated_rows = connection.execute('SELECT organizer, event_count FROM "events" ORDER BY rowid').fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(updated_rows, [("Updated organizer", 2), ("Second row", 3)])
+
+            skipped = namespace["write_values_to_sqlite"]("events", [
+                {"name": "organizer", "type": "TEXT", "value": "", "write": True},
+            ], False, 0.88, {"__sui_table": "events", "__sui_rowid": 1})
+            self.assertTrue(skipped["skipped"])
+            connection = sqlite3.connect(Path(directory) / "writer.db")
+            try:
+                self.assertEqual(connection.execute('SELECT COUNT(*) FROM "events"').fetchone()[0], 2)
+            finally:
+                connection.close()
+
         with self.assertRaises(ValueError):
             main.normalize_definition({
                 "mode": "headless",
@@ -361,8 +388,113 @@ class GeneratorRegressionTests(unittest.TestCase):
                 self.assertFalse(extended["created"])
                 self.assertEqual([(column["name"], column["type"]) for column in extended["columns"]], [("organizer", "TEXT"), ("event_count", "INTEGER")])
                 self.assertEqual([(column["name"], column["type"]) for column in edited["columns"]], [("organizer", "REAL"), ("event_count", "INTEGER")])
+                connection = main.db_connection()
+                try:
+                    connection.execute('INSERT INTO "events" (organizer, event_count) VALUES (?, ?)', ("Saved row", 3))
+                    connection.commit()
+                finally:
+                    connection.close()
+                trimmed = main.craft_table("events", [{"name": "organizer", "original_name": "organizer", "type": "TEXT"}])
+                self.assertEqual([column["name"] for column in trimmed["columns"]], ["organizer"])
+                connection = main.db_connection()
+                try:
+                    self.assertEqual(connection.execute('SELECT organizer FROM "events"').fetchone()[0], "Saved row")
+                finally:
+                    connection.close()
             finally:
                 main.DB_PATH = original_db_path
+
+    def test_writer_semantic_duplicates_are_stored_without_inserting_main_row(self):
+        definition = {
+            "mode": "headless",
+            "steps": [{
+                "id": "step_writer",
+                "type": "writer",
+                "settings": {
+                    "table_name": "events",
+                    "semantic_duplicate_removal": True,
+                    "columns": [
+                        {"name": "title", "type": "TEXT", "value": "Live concert organizer", "write": True},
+                        {"name": "city", "type": "TEXT", "value": "New York", "write": True},
+                    ],
+                },
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertTrue(normalized["steps"][0]["settings"]["semantic_duplicate_removal"])
+        source_tree = ast.parse(main.generate_python(normalized))
+        helper_names = {"semantic_row_text", "semantic_row_similarity", "record_semantic_duplicate", "write_values_to_sqlite"}
+        helper_nodes = [node for node in source_tree.body if isinstance(node, ast.FunctionDef) and node.name in helper_names]
+        with tempfile.TemporaryDirectory() as directory:
+            namespace = {
+                "ast": ast,
+                "difflib": difflib,
+                "json": json,
+                "os": os,
+                "re": re,
+                "sqlite3": sqlite3,
+                "time": time,
+                "WRITER_DB_PATH": str(Path(directory) / "writer.db"),
+            }
+            exec(compile(ast.Module(body=helper_nodes, type_ignores=[]), "writer_helper.py", "exec"), namespace)
+            write = namespace["write_values_to_sqlite"]
+            write("events", [
+                {"name": "title", "type": "TEXT", "value": "Live concert organizer", "write": True},
+                {"name": "city", "type": "TEXT", "value": "New York", "write": True},
+            ], True, 0.88)
+            result = write("events", [
+                {"name": "title", "type": "TEXT", "value": "Live concert organizers", "write": True},
+                {"name": "city", "type": "TEXT", "value": "New York", "write": True},
+            ], True, 0.88)
+            self.assertTrue(result["duplicate"])
+            connection = sqlite3.connect(Path(directory) / "writer.db")
+            try:
+                event_rows = connection.execute('SELECT COUNT(*) FROM "events"').fetchone()[0]
+                duplicate = connection.execute('SELECT source_table, incoming_row, existing_row FROM "duplicates"').fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(event_rows, 1)
+            self.assertEqual(duplicate[0], "events")
+            self.assertIn("Live concert organizers", duplicate[1])
+            self.assertIn("Live concert organizer", duplicate[2])
+
+    def test_orchest_recipe_normalizes_and_generates_recipe_call_activity(self):
+        definition = {
+            "mode": "headless",
+            "recipe_type": "orchest",
+            "steps": [{
+                "id": "step_call",
+                "type": "invoke_recipe",
+                "settings": {"recipe_id": "recipe_child", "recipe_name": "child"},
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe_parent", "parent", 1, require_first_navigation=False)
+        self.assertEqual(normalized["recipe_type"], "orchest")
+        self.assertEqual(normalized["steps"][0]["settings"]["recipe_id"], "recipe_child")
+        for source in (main.generate_python(normalized), main.generate_step_python(normalized)):
+            ast.parse(source)
+            self.assertIn("run_called_recipe", source)
+            self.assertIn("Recursive recipe calls are not allowed", source)
+            self.assertIn("if target_id:", source)
+            self.assertNotIn("? = '')", source)
+
+        with self.assertRaises(ValueError):
+            main.normalize_definition({
+                "recipe_type": "standard",
+                "steps": [{"id": "step_call", "type": "call_recipe", "settings": {"recipe_name": "child"}}],
+            }, "project", "recipe_parent", "parent", 1, require_first_navigation=False)
+
+    def test_orchest_recipe_does_not_require_initial_navigation(self):
+        normalized = main.normalize_definition({
+            "recipe_type": "orchest",
+            "steps": [{
+                "id": "step_message",
+                "type": "message_box",
+                "settings": {"message": "start"},
+            }],
+        }, "project", "recipe_orchest", "orchestrator", 1)
+        self.assertEqual(normalized["recipe_type"], "orchest")
+        self.assertEqual(normalized["steps"][0]["type"], "message_box")
 
     def test_craft_table_can_insert_and_update_rows(self):
         original_db_path = main.DB_PATH
@@ -375,6 +507,8 @@ class GeneratorRegressionTests(unittest.TestCase):
                 row_id = inserted["rows"][0]["__sui_rowid"]
                 updated = main.data_table_row("events", "update", row_id=row_id, column_name="count", value="2")
                 self.assertEqual(updated["rows"][0]["count"], 2)
+                deleted = main.data_table_row("events", "delete", row_id=row_id)
+                self.assertEqual(deleted["rows"], [])
             finally:
                 main.DB_PATH = original_db_path
 
@@ -480,6 +614,8 @@ class GeneratorRegressionTests(unittest.TestCase):
             self.assertIn("read_sqlite_table", source)
             self.assertIn("settings.get('source') == 'table'", source)
             self.assertIn("Unknown row column", source)
+            self.assertIn("currentRow", source)
+            self.assertIn("UPDATE {quoted_table} SET {assignments} WHERE rowid = ?", source)
 
     def test_full_and_single_step_paths_wait_for_the_same_resolved_loop_targets(self):
         definition = {
@@ -508,6 +644,108 @@ class GeneratorRegressionTests(unittest.TestCase):
         self.assertIn("for loop_index in range(loop_start, loop_start + loop_count)", full_source)
         self.assertIn("execute_steps(page, (step.get('branches') or {}).get('body', []))", full_source)
 
+    def test_pattern_matcher_normalizes_or_patterns_and_generates_both_runtimes(self):
+        definition = {
+            "mode": "headless",
+            "variables": [{"id": "variable_match", "name": "match", "value": ""}],
+            "steps": [{
+                "id": "step_pattern",
+                "type": "pattern_matcher",
+                "settings": {
+                    "patterns": [r"Organizer:\s*(.+)", r"Host:\s*(.+)"],
+                    "variable": "match",
+                },
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(normalized["steps"][0]["settings"]["patterns"], [r"Organizer:\s*(.+)", r"Host:\s*(.+)"])
+        for source in (main.generate_python(normalized), main.generate_step_python(normalized)):
+            ast.parse(source)
+            self.assertIn("page.locator('body').inner_text()", source)
+            self.assertIn("re.finditer(combined_pattern, source, re.IGNORECASE)", source)
+            self.assertIn("' | '.join(matches)", source)
+            self.assertIn("NO CONTACTS FOUND", source)
+
+        with self.assertRaises(ValueError):
+            main.normalize_definition({
+                "variables": [{"id": "variable_match", "name": "match", "value": ""}],
+                "steps": [{"type": "pattern_matcher", "settings": {
+                    "source": "text", "patterns": ["["], "variable": "match",
+                }}],
+            }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+
+    def test_smartie_normalizes_prompts_schema_and_generates_both_runtimes(self):
+        definition = {
+            "mode": "headless",
+            "variables": [
+                {"id": "variable_input", "name": "input", "value": "hello"},
+                {"id": "variable_result", "name": "result", "value": ""},
+            ],
+            "steps": [{
+                "id": "step_smartie",
+                "type": "smartie",
+                "settings": {
+                    "system_prompt": "Return only structured data.",
+                    "user_prompt": "Classify {input} and {currentRow.name}.",
+                    "model": "gemini-2.5-flash",
+                    "output_type": "json",
+                    "output_variable": "result",
+                    "schema": [
+                        {"name": "label", "type": "string", "required": True},
+                        {"name": "score", "type": "number", "required": False},
+                    ],
+                },
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        settings = normalized["steps"][0]["settings"]
+        self.assertEqual(settings["provider"], "google_gemini")
+        self.assertEqual(settings["model"], "gemini-2.5-flash")
+        self.assertEqual(settings["output_variable"], "result")
+        self.assertEqual(settings["schema"][0]["name"], "label")
+        for source in (main.generate_python(normalized), main.generate_step_python(normalized)):
+            ast.parse(source)
+            self.assertIn("GOOGLE_GEMINI_KEY", source)
+            self.assertIn("run_smartie", source)
+            self.assertIn("gemini-2.5-flash", source)
+            self.assertIn("'x-goog-api-key': api_key", source)
+            self.assertNotIn("?key=' + quote(api_key", source)
+            self.assertIn("resolve(settings.get('user_prompt'), variables)", source)
+            self.assertIn("responseSchema", source)
+
+        migrated = main.normalize_definition({
+            "variables": [{"name": "result", "value": ""}],
+            "steps": [{"type": "smartie", "settings": {
+                "user_prompt": "Return text", "output_type": "text", "output_variable": "result",
+                "model": "gemini-2.0-flash",
+            }}],
+        }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(migrated["steps"][0]["settings"]["model"], "gemini-2.5-flash")
+
+        with self.assertRaises(ValueError):
+            main.normalize_definition({
+                "variables": [{"name": "result", "value": ""}],
+                "steps": [{"type": "smartie", "settings": {
+                    "user_prompt": "Return JSON", "output_type": "json", "output_variable": "result", "schema": [],
+                }}],
+            }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+
+        with self.assertRaises(ValueError):
+            main.normalize_definition({
+                "variables": [{"name": "result", "value": ""}],
+                "steps": [{"type": "smartie", "settings": {
+                    "model": "unsupported-model", "user_prompt": "Return text", "output_variable": "result",
+                }}],
+            }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+
+        text_definition = main.normalize_definition({
+            "variables": [{"name": "result", "value": ""}],
+            "steps": [{"type": "smartie", "settings": {
+                "user_prompt": "Return text", "output_variable": "result", "schema": [{"name": "", "type": "string"}],
+            }}],
+        }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(text_definition["steps"][0]["settings"]["schema"], [])
+
     def test_click_recovery_and_command_scoped_failure_logging_exist_in_both_paths(self):
         definition = {
             "mode": "headless",
@@ -524,6 +762,23 @@ class GeneratorRegressionTests(unittest.TestCase):
             self.assertIn("navigated = page_url(page) != source_url or bool(new_pages(page, before_pages))", source)
             self.assertIn("if not navigated: raise", source)
             self.assertIn("command_id={step.get('command_id', '')}", source)
+
+    def test_frame_transition_retries_locator_and_body_reads_in_both_paths(self):
+        normalized = main.normalize_definition({
+            "mode": "headless",
+            "steps": [{"id": "step_for", "type": "for", "settings": {
+                "iterator": "i", "start_value": 0, "range_value": "1",
+            }, "branches": {"body": [{
+                "id": "step_pattern", "type": "pattern_matcher",
+                "settings": {"patterns": [r"\\btest\\b"], "variable": "result"},
+            }]}}],
+            "variables": [{"name": "result", "value": ""}],
+        }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        for source in (main.generate_python(normalized), main.generate_step_python(normalized)):
+            ast.parse(source)
+            self.assertIn("'frame ownership changed'", source)
+            self.assertIn("page_body_text", source)
+            self.assertTrue("time.sleep(0.10)" in source or "await asyncio.sleep(0.10)" in source)
 
     def test_loop_body_continues_after_bounded_load_completion_delay(self):
         definition = {

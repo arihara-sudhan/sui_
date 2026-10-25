@@ -8,6 +8,8 @@ const DELAY_STEP_TYPE = 'delay'
 const KEYPRESS_STEP_TYPE = 'keypress'
 const ASSIGN_STEP_TYPE = 'assign'
 const SCRAPE_STEP_TYPE = 'scrape'
+const PATTERN_MATCHER_STEP_TYPE = 'pattern_matcher'
+const SMARTIE_STEP_TYPE = 'smartie'
 const MESSAGE_BOX_STEP_TYPE = 'message_box'
 const CHECK_ELEMENT_EXISTS_STEP_TYPE = 'check_element_exists'
 const CHECK_TEXT_EXISTS_STEP_TYPE = 'check_text_exists'
@@ -15,6 +17,8 @@ const IF_STEP_TYPE = 'if'
 const FOR_STEP_TYPE = 'for'
 const USE_JS_STEP_TYPE = 'use_js'
 const WRITER_STEP_TYPE = 'writer'
+const CALL_RECIPE_STEP_TYPE = 'call_recipe'
+const INVOKE_RECIPE_STEP_TYPE = 'invoke_recipe'
 const KEYPRESS_OPTIONS = ['Enter', 'Escape', 'Tab', 'Backspace', 'Delete', 'Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown', 'Insert', 'Control', 'Shift', 'Alt', 'Meta', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12', ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'.split('')]
 const NAVIGATE_ACTIONS = [{ value: 'back', label: 'Back' }, { value: 'forward', label: 'Forward' }, { value: 'refresh', label: 'Refresh' }]
 const API_ROOT = 'http://127.0.0.1:8000/api'
@@ -26,15 +30,19 @@ const stepLabel = (step) => (
     : step.type === FILL_STEP_TYPE ? 'Fill'
       : step.type === DELAY_STEP_TYPE ? 'Delay'
         : step.type === KEYPRESS_STEP_TYPE ? 'Keypress'
-        : step.type === ASSIGN_STEP_TYPE ? 'Assign'
-          : step.type === SCRAPE_STEP_TYPE ? 'Scrape'
-            : step.type === MESSAGE_BOX_STEP_TYPE ? 'Message box'
+          : step.type === ASSIGN_STEP_TYPE ? 'Assign'
+            : step.type === SCRAPE_STEP_TYPE ? 'Scrape'
+            : step.type === PATTERN_MATCHER_STEP_TYPE ? 'Pattern Matcher'
+              : step.type === SMARTIE_STEP_TYPE ? 'Smartie'
+              : step.type === MESSAGE_BOX_STEP_TYPE ? 'Message box'
               : step.type === CHECK_ELEMENT_EXISTS_STEP_TYPE ? 'Check element exists'
                 : step.type === CHECK_TEXT_EXISTS_STEP_TYPE ? 'Check text exists'
                   : step.type === IF_STEP_TYPE ? 'If'
                       : step.type === FOR_STEP_TYPE ? (step.settings?.source === 'table' ? 'For each' : 'For loop')
                       : step.type === USE_JS_STEP_TYPE ? 'Use JS'
                       : step.type === WRITER_STEP_TYPE ? 'Writer'
+                      : step.type === CALL_RECIPE_STEP_TYPE ? 'Run recipe'
+                      : step.type === INVOKE_RECIPE_STEP_TYPE ? 'Invoke'
                       : 'Navigate to website'
 )
 
@@ -150,6 +158,7 @@ const blankDefinition = () => ({
   connections: [],
   variables: [],
   mode: 'headful',
+  recipe_type: 'standard',
 })
 
 const blankRecipe = () => ({
@@ -180,6 +189,35 @@ const api = async (path, options = {}) => {
   return body
 }
 
+function Toast({ message, onClose }) {
+  const [leaving, setLeaving] = useState(false)
+  const closingRef = useRef(false)
+
+  useEffect(() => {
+    let removeTimer
+    const dismiss = () => {
+      if (closingRef.current) return
+      closingRef.current = true
+      setLeaving(true)
+      removeTimer = window.setTimeout(onClose, 240)
+    }
+    const timer = window.setTimeout(dismiss, 5000)
+    return () => {
+      window.clearTimeout(timer)
+      if (removeTimer) window.clearTimeout(removeTimer)
+    }
+  }, [message])
+
+  const dismissNow = () => {
+    if (closingRef.current) return
+    closingRef.current = true
+    setLeaving(true)
+    window.setTimeout(onClose, 240)
+  }
+
+  return <div className={`toast success-toast${leaving ? ' toast-leaving' : ''}`} role="status"><button type="button" className="toast-close" onClick={dismissNow} aria-label="Dismiss notification">×</button><span>{message}</span></div>
+}
+
 const streamEvents = async (path, onEvent) => {
   const response = await fetch(`${API_ROOT}${path}`)
   if (!response.ok || !response.body) throw new Error('Unable to connect to execution stream')
@@ -199,6 +237,16 @@ const streamEvents = async (path, onEvent) => {
   }
 }
 
+const migrateSmartieSteps = (steps) => (steps || []).map((step) => ({
+  ...step,
+  settings: step.type === SMARTIE_STEP_TYPE && step.settings?.model === 'gemini-2.0-flash'
+    ? { ...step.settings, model: 'gemini-2.5-flash' }
+    : step.settings,
+  branches: Object.keys(step.branches || {}).length
+    ? Object.fromEntries(Object.entries(step.branches).map(([key, branch]) => [key, migrateSmartieSteps(branch)]))
+    : step.branches,
+}))
+
 const hydrateProject = (project) => ({
   projectId: project.id,
   projectName: project.name,
@@ -206,7 +254,7 @@ const hydrateProject = (project) => ({
     localKey: recipe.id || makeKey('recipe'),
     id: recipe.id,
     name: recipe.name,
-    definition: recipe.definition || blankDefinition(),
+    definition: { ...blankDefinition(), ...(recipe.definition || {}), steps: migrateSmartieSteps(recipe.definition?.steps || []) },
   })),
 })
 
@@ -460,6 +508,22 @@ function App() {
     return addStepToRecipe(step, branchTarget)
   }
 
+  const addPatternMatcherStep = (position = { x: 48, y: 48 }, branchTarget = null) => addStepToRecipe({
+    id: makeKey('step'),
+    type: PATTERN_MATCHER_STEP_TYPE,
+    settings: { patterns: [''], variable: '' },
+    connections: { next: [] },
+    position,
+  }, branchTarget)
+
+  const addSmartieStep = (position = { x: 48, y: 48 }, branchTarget = null) => addStepToRecipe({
+    id: makeKey('step'),
+    type: SMARTIE_STEP_TYPE,
+    settings: { provider: 'google_gemini', model: 'gemini-2.5-flash', system_prompt: '', user_prompt: '', output_type: 'text', output_variable: '', schema: [] },
+    connections: { next: [] },
+    position,
+  }, branchTarget)
+
   const addCheckElementExistsStep = (position = { x: 48, y: 48 }, branchTarget = null) => addStepToRecipe({
     id: makeKey('step'), type: CHECK_ELEMENT_EXISTS_STEP_TYPE, settings: { selector: '', timeout_seconds: 5 },
     connections: { next: [] }, position, branches: { exists: [], not_exists: [] },
@@ -491,7 +555,17 @@ function App() {
   }, branchTarget)
 
   const addWriterStep = (position = { x: 48, y: 48 }, branchTarget = null) => addStepToRecipe({
-    id: makeKey('step'), type: WRITER_STEP_TYPE, settings: { value: '', table_name: '', columns: [{ name: 'value', type: 'TEXT', value: '', write: true }] },
+    id: makeKey('step'), type: WRITER_STEP_TYPE, settings: { value: '', table_name: '', columns: [{ name: 'value', type: 'TEXT', value: '', write: true }], semantic_duplicate_removal: false, duplicate_threshold: 0.88 },
+    connections: { next: [] }, position,
+  }, branchTarget)
+
+  const addCallRecipeStep = (position = { x: 48, y: 48 }, branchTarget = null) => addStepToRecipe({
+    id: makeKey('step'), type: CALL_RECIPE_STEP_TYPE, settings: { recipe_id: '', recipe_name: '' },
+    connections: { next: [] }, position,
+  }, branchTarget)
+
+  const addInvokeRecipeStep = (position = { x: 48, y: 48 }, branchTarget = null) => addStepToRecipe({
+    id: makeKey('step'), type: INVOKE_RECIPE_STEP_TYPE, settings: { recipe_id: '', recipe_name: '' },
     connections: { next: [] }, position,
   }, branchTarget)
 
@@ -620,7 +694,7 @@ function App() {
       </header>
 
       <main className="main-content">
-        {notice && <div className="toast success-toast">{notice}</div>}
+        {notice && <Toast message={notice} onClose={() => setNotice('')} />}
         {error && <div className="toast error-toast">{error}</div>}
         {view === 'studio' && (
           <StudioView
@@ -646,6 +720,8 @@ function App() {
             addAssignStep={addAssignStep}
             addMessageBoxStep={addMessageBoxStep}
             addScrapeStep={addScrapeStep}
+            addPatternMatcherStep={addPatternMatcherStep}
+            addSmartieStep={addSmartieStep}
             addCheckElementExistsStep={addCheckElementExistsStep}
             addCheckTextExistsStep={addCheckTextExistsStep}
             addIfStep={addIfStep}
@@ -653,6 +729,8 @@ function App() {
             addForEachStep={addForEachStep}
             addUseJsStep={addUseJsStep}
             addWriterStep={addWriterStep}
+            addCallRecipeStep={addCallRecipeStep}
+            addInvokeRecipeStep={addInvokeRecipeStep}
             saveStudio={saveStudio}
             runFullRecipe={runFullRecipe}
             stopJob={stopJob}
@@ -679,7 +757,7 @@ function App() {
 
 function StudioView({
   studio, studioMode, activeRecipe, activeRecipeKey, setActiveRecipeKey, updateRecipe, deleteRecipe, selectedStepId, setSelectedStepId, updateStudio, updateActiveRecipe, updateStep, deleteStep,
-  addNavigationStep, addNavigateActionStep, addClickStep, addFillStep, addDelayStep, addKeypressStep, addAssignStep, addMessageBoxStep, addScrapeStep, addCheckElementExistsStep, addCheckTextExistsStep, addIfStep, addForStep, addForEachStep, addUseJsStep, addWriterStep, saveStudio, runFullRecipe, stopJob, newRecipe,
+  addNavigationStep, addNavigateActionStep, addClickStep, addFillStep, addDelayStep, addKeypressStep, addAssignStep, addMessageBoxStep, addScrapeStep, addPatternMatcherStep, addSmartieStep, addCheckElementExistsStep, addCheckTextExistsStep, addIfStep, addForStep, addForEachStep, addUseJsStep, addWriterStep, addCallRecipeStep, addInvokeRecipeStep, saveStudio, runFullRecipe, stopJob, newRecipe,
 }) {
   const [editingRecipeKey, setEditingRecipeKey] = useState(null)
   const [rightMode, setRightMode] = useState('viewer')
@@ -715,6 +793,8 @@ function StudioView({
   const steps = activeRecipe?.definition.steps || []
   const selectedStep = findStepInTree(steps, selectedStepId)
   const allSteps = flattenSteps(steps)
+  const callableRecipes = studio.recipes.filter((recipe) => recipe.localKey !== activeRecipeKey && (recipe.id || recipe.name.trim()))
+  const invokeRecipes = studio.recipes.filter((recipe) => recipe.id || recipe.name.trim())
   const firstStep = steps[0]
   const executionMode = activeRecipe?.definition?.mode || 'headful'
   const executionScopeKey = `${studio.projectId || 'draft-project'}:${activeRecipe?.id || activeRecipe?.localKey || 'draft-recipe'}:${studioSessionId}:${executionMode}`
@@ -725,6 +805,8 @@ function StudioView({
     && execution.sessionScopeKey === executionScopeKey
     && Boolean(execution.navigationRunId)
     && !(execution.stepId === firstStep?.id && execution.status === 'running')
+  const requiresInitialNavigation = activeRecipe?.definition?.recipe_type !== 'orchest'
+  const activityPickerLocked = activeRecipe?.definition?.recipe_type !== 'orchest' && !navigationRunCompleted
   const variables = activeRecipe?.definition?.variables || []
   const writerColumns = selectedStep?.settings?.columns?.length
     ? selectedStep.settings.columns
@@ -945,7 +1027,8 @@ function StudioView({
   const runStepLive = async (step) => {
     if (step.disabled) return
     const isFirstNavigation = step.id === firstStep?.id && step.type === STEP_TYPE
-    if (!isFirstNavigation && !navigationRunCompleted) return
+    const isOrchestRecipe = activeRecipe?.definition?.recipe_type === 'orchest'
+    if (!isFirstNavigation && !navigationRunCompleted && !isOrchestRecipe) return
     for (const [commandId, pending] of pendingCommandsRef.current.entries()) {
       if (pending.kind === 'step') pendingCommandsRef.current.delete(commandId)
     }
@@ -954,7 +1037,7 @@ function StudioView({
     sendViewerInput({ type: 'clear_picker_overlay' })
     setRightMode('viewer')
     setPickerActive(false)
-    const isFreshSession = isFirstNavigation && execution.sessionStatus !== 'ready'
+    const isFreshSession = execution.sessionStatus !== 'ready'
     setExecution((current) => ({
       ...current,
       status: 'running',
@@ -979,6 +1062,7 @@ function StudioView({
             recipe_id: activeRecipe?.id || activeRecipe?.localKey || 'draft-recipe',
             studio_session_id: studioSessionId,
             mode: executionMode,
+            recipe_type: activeRecipe?.definition?.recipe_type || 'standard',
             variables,
           }),
         })
@@ -1047,7 +1131,7 @@ function StudioView({
     setRightMode('editor')
   }
   const activatePicker = (targetStepId = null, action = 'click') => {
-    if (!navigationRunCompleted) return
+    if (activeRecipe?.definition?.recipe_type !== 'orchest' && !navigationRunCompleted) return
     setRightMode('viewer')
     setPickerActive(true)
     setPickerTargetStepId(targetStepId)
@@ -1060,8 +1144,8 @@ function StudioView({
     setExecution((current) => ({ ...current, pickerElement: null, error: null }))
   }
   const beginActivityPicker = (action) => {
-    if (!navigationReadyToAddActivities) return
-    if (navigationRunCompleted) activatePicker(null, action)
+    if (activeRecipe?.definition?.recipe_type !== 'orchest' && !navigationReadyToAddActivities) return
+    if (activeRecipe?.definition?.recipe_type === 'orchest' || navigationRunCompleted) activatePicker(null, action)
   }
   const choosePickerSelector = (selector) => {
     const value = String(selector || '').trim()
@@ -1241,7 +1325,7 @@ function StudioView({
   }
 
   const renderStepList = (items, depth = 0, branchContext = null) => (items || []).map((step, index) => {
-    const stepLocked = Boolean(step.disabled) || (!(step.id === firstStep?.id && step.type === STEP_TYPE) && !navigationRunCompleted)
+    const stepLocked = Boolean(step.disabled) || (requiresInitialNavigation && !(step.id === firstStep?.id && step.type === STEP_TYPE) && !navigationRunCompleted)
     const stepDraggable = !(step.id === firstStep?.id && step.type === STEP_TYPE)
     return (
       <React.Fragment key={step.id}>
@@ -1311,7 +1395,7 @@ function StudioView({
           <div className="palette">
             <div className="section-label">Blocks</div>
             {false && steps.map((step, index) => {
-              const stepLocked = !(step.id === firstStep?.id && step.type === STEP_TYPE) && !navigationRunCompleted
+              const stepLocked = requiresInitialNavigation && !(step.id === firstStep?.id && step.type === STEP_TYPE) && !navigationRunCompleted
               return (
               <div
                 className={`${selectedStepId === step.id ? 'step-list-item selected' : 'step-list-item'}${stepLocked ? ' locked' : ''}`}
@@ -1376,7 +1460,7 @@ function StudioView({
                     execution={execution}
                     onInput={sendViewerInput}
                     pickerActive={pickerActive}
-                    pickerEnabled={navigationRunCompleted}
+                    pickerEnabled={navigationRunCompleted || activeRecipe?.definition?.recipe_type === 'orchest'}
                     onPickerToggle={() => activatePicker()}
                   />
                 )}
@@ -1392,51 +1476,63 @@ function StudioView({
                 <button className="picker-option" disabled={Boolean(steps.length && firstStep?.type !== STEP_TYPE) || Boolean(branchTarget)} onClick={() => { addNavigationStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }}>
                   <span className="block-icon">↗</span><span>Navigate to website</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addNavigateActionStep({ x: 48, y: 48 }, 'back', branchTarget); setRightMode('editor') }} title="Go back, go forward, or refresh the current page">
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addNavigateActionStep({ x: 48, y: 48 }, 'back', branchTarget); setRightMode('editor') }} title="Go back, go forward, or refresh the current page">
                   <span className="block-icon">↔</span><span>Navigate</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => beginActivityPicker('click')} title={!navigationReadyToAddActivities ? 'Add a URL to the first Navigate to website step first' : 'Run the first Navigate to website step before picking an element'}>
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => beginActivityPicker('click')} title={!navigationReadyToAddActivities ? 'Add a URL to the first Navigate to website step first' : 'Run the first Navigate to website step before picking an element'}>
                   <span className="block-icon">+</span><span>Click</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => beginActivityPicker('fill')} title="Run the first Navigate to website step before picking an element">
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => beginActivityPicker('fill')} title="Run the first Navigate to website step before picking an element">
                   <span className="block-icon">+</span><span>Fill</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addDelayStep({ x: 48, y: 48 }, 1, branchTarget); setRightMode('editor') }} title="Run the first Navigate to website step before adding a delay">
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addDelayStep({ x: 48, y: 48 }, 1, branchTarget); setRightMode('editor') }} title="Run the first Navigate to website step before adding a delay">
                   <span className="block-icon">+</span><span>Delay</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addKeypressStep({ x: 48, y: 48 }, 'Enter', branchTarget); setRightMode('editor') }} title="Send a keyboard key to the browser">
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addKeypressStep({ x: 48, y: 48 }, 'Enter', branchTarget); setRightMode('editor') }} title="Send a keyboard key to the browser">
                   <span className="block-icon">+</span><span>Keypress</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted || !variables.length} onClick={() => { addAssignStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title={!variables.length ? 'Create a variable in recipe configuration first' : 'Assign a recipe variable'}>
+                <button className="picker-option" disabled={activityPickerLocked || (!variables.length && activeRecipe?.definition?.recipe_type !== 'orchest')} onClick={() => { addAssignStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title={!variables.length ? 'Create a variable in recipe configuration first' : 'Assign a recipe variable'}>
                   <span className="block-icon">+</span><span>Assign</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => beginActivityPicker('scrape')} title="Pick an element and store its text in a recipe variable">
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => beginActivityPicker('scrape')} title="Pick an element and store its text in a recipe variable">
                   <span className="block-icon">+</span><span>Scrape</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addMessageBoxStep({ x: 48, y: 48 }, '', branchTarget); setRightMode('editor') }} title="Show a message with an OK button">
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addPatternMatcherStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Extract the first match from text using one or more regex patterns">
+                  <span className="block-icon">.*</span><span>Pattern Matcher</span>
+                </button>
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addSmartieStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Use Google Gemini with prompts and a structured output">
+                  <span className="block-icon">AI</span><span>Smartie</span>
+                </button>
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addMessageBoxStep({ x: 48, y: 48 }, '', branchTarget); setRightMode('editor') }} title="Show a message with an OK button">
                   <span className="block-icon">+</span><span>Message box</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addCheckElementExistsStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }}>
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addCheckElementExistsStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }}>
                   <span className="block-icon">?</span><span>Check element exists</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addCheckTextExistsStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }}>
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addCheckTextExistsStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }}>
                   <span className="block-icon">?</span><span>Check text exists</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addIfStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }}>
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addIfStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }}>
                   <span className="block-icon">↳</span><span>If / else</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addForStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Repeat nested steps for a fixed count or recipe variable">
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addForStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Repeat nested steps for a fixed count or recipe variable">
                   <span className="block-icon">#</span><span>For loop</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addForEachStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Read each row or column value from a local SQLite table">
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addForEachStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Read each row or column value from a local SQLite table">
                   <span className="block-icon">↻</span><span>For each</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addUseJsStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Run a JavaScript function body with optional recipe variables">
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addUseJsStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Run a JavaScript function body with optional recipe variables">
                   <span className="block-icon">JS</span><span>Use JS</span>
                 </button>
-                <button className="picker-option" disabled={!navigationRunCompleted} onClick={() => { addWriterStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Append a value to a local SQLite table">
+                <button className="picker-option" disabled={activityPickerLocked} onClick={() => { addWriterStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Append a value to a local SQLite table">
                   <span className="block-icon">DB</span><span>Writer</span>
                 </button>
+                {activeRecipe?.definition?.recipe_type === 'orchest' && <button className="picker-option" disabled={activityPickerLocked || !callableRecipes.length} onClick={() => { addCallRecipeStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title={!callableRecipes.length ? 'Create another recipe in this project first' : 'Run another recipe in this browser session'}>
+                  <span className="block-icon">↗</span><span>Run recipe</span>
+                </button>}
+                {activeRecipe?.definition?.recipe_type === 'orchest' && <button className="picker-option" disabled={activityPickerLocked || !invokeRecipes.length} onClick={() => { addInvokeRecipeStep({ x: 48, y: 48 }, branchTarget); setRightMode('editor') }} title="Invoke a selected recipe in sequence">
+                  <span className="block-icon">→</span><span>Invoke</span>
+                </button>}
                 <button className="back-to-view" type="button" onClick={() => setRightMode('viewer')}>BACK TO VIEW</button>
               </div>
             )}
@@ -1506,6 +1602,59 @@ function StudioView({
                     </select></label>
                     <button className="secondary-button picker-launch" disabled={!navigationRunCompleted} onClick={() => activatePicker(selectedStep.id, 'scrape')}>Pick element in TV</button>
                   </>
+                ) : selectedStep.type === PATTERN_MATCHER_STEP_TYPE ? (
+                  <>
+                    <p className="detail-copy">Scan the currently active page text with these OR-joined regular expressions. All matches are stored in page order as one string separated by <code> | </code>.</p>
+                    <label>Store match in<select value={selectedStep.settings?.variable || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, variable: event.target.value } }))}>
+                      <option value="">Choose a variable</option>
+                      {variables.map((variable) => <option key={variable.id} value={variable.name}>{variable.name}</option>)}
+                    </select></label>
+                    <div className="section-label">Regex patterns (OR)</div>
+                    <div className="pattern-list">
+                      {(selectedStep.settings?.patterns || ['']).map((pattern, index) => (
+                        <div className="pattern-row" key={`${selectedStep.id}-pattern-${index}`}>
+                          <input value={pattern || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, patterns: (current.settings.patterns || ['']).map((item, itemIndex) => itemIndex === index ? event.target.value : item) } }))} placeholder="([A-Z][a-z]+)" aria-label={`Regex pattern ${index + 1}`} />
+                          {index < (selectedStep.settings?.patterns || ['']).length - 1 && <span className="pattern-or">OR</span>}
+                          <button className="delete-button" type="button" onClick={() => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, patterns: (current.settings.patterns || ['']).filter((_, itemIndex) => itemIndex !== index) } }))} disabled={(selectedStep.settings?.patterns || ['']).length <= 1} title="Remove pattern">×</button>
+                        </div>
+                      ))}
+                    </div>
+                    <button className="secondary-button" type="button" onClick={() => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, patterns: [...(current.settings.patterns || ['']), ''] } }))}>+ Add regex pattern</button>
+                  </>
+                ) : selectedStep.type === SMARTIE_STEP_TYPE ? (
+                  <>
+                    <p className="detail-copy">Use Google Gemini with prompts and store its response in a recipe variable. Prompts support {'{'}variableName{'}'}, {'{'}currentRow.columnName{'}'}, and {'{'}columnName{'}'}.</p>
+                    <label>Gemini model<select value={selectedStep.settings?.model || 'gemini-2.5-flash'} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, model: event.target.value } }))}>
+                      <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                    </select></label>
+                    <label>System prompt<textarea value={selectedStep.settings?.system_prompt || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, system_prompt: event.target.value } }))} placeholder="How Smartie should behave" /></label>
+                    <label>User prompt<textarea value={selectedStep.settings?.user_prompt || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, user_prompt: event.target.value } }))} placeholder="Ask Smartie something using recipe variables if needed" /></label>
+                    <label>Output variable<select value={selectedStep.settings?.output_variable || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, output_variable: event.target.value } }))}>
+                      <option value="">Choose a variable</option>
+                      {variables.map((variable) => <option key={variable.id} value={variable.name}>{variable.name}</option>)}
+                    </select></label>
+                    <label>Output schema<select value={selectedStep.settings?.output_type || 'text'} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, output_type: event.target.value } }))}>
+                      <option value="text">Text</option><option value="number">Number</option><option value="json">JSON</option>
+                    </select></label>
+                    {selectedStep.settings?.output_type === 'json' && (
+                      <>
+                        <div className="section-label">JSON fields</div>
+                        <div className="smartie-schema-list">
+                          {(selectedStep.settings?.schema || []).map((field, index) => (
+                            <div className="smartie-schema-row" key={`${selectedStep.id}-schema-${index}`}>
+                              <input value={field.name || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, schema: (current.settings.schema || []).map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item) } }))} placeholder="Field name" />
+                              <select value={field.type || 'string'} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, schema: (current.settings.schema || []).map((item, itemIndex) => itemIndex === index ? { ...item, type: event.target.value } : item) } }))}>
+                                <option value="string">Text</option><option value="number">Number</option><option value="boolean">Boolean</option><option value="json">Object</option>
+                              </select>
+                              <label className="check-option"><input type="checkbox" checked={field.required !== false} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, schema: (current.settings.schema || []).map((item, itemIndex) => itemIndex === index ? { ...item, required: event.target.checked } : item) } }))} /> Required</label>
+                              <button className="delete-button" type="button" onClick={() => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, schema: (current.settings.schema || []).filter((_, itemIndex) => itemIndex !== index) } }))} disabled={(selectedStep.settings?.schema || []).length <= 1} title="Remove JSON field">×</button>
+                            </div>
+                          ))}
+                        </div>
+                        <button className="secondary-button" type="button" onClick={() => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, schema: [...(current.settings.schema || []), { name: '', type: 'string', required: true }] } }))}>+ Add JSON field</button>
+                      </>
+                    )}
+                  </>
                 ) : selectedStep.type === CHECK_ELEMENT_EXISTS_STEP_TYPE ? (
                   <>
                     <p className="detail-copy">Check whether this selector exists, then choose the Exists or Not exists branch in Blocks to add nested steps.</p>
@@ -1525,6 +1674,8 @@ function StudioView({
                     {selectedStep.settings?.source === 'table' ? (
                     <>
                     <p className="detail-copy">Read each row or selected column from a local SQLite table, then run the steps in Loop body.</p>
+                    <label>Current row<input value="currentRow" readOnly aria-label="Current row variable" /></label>
+                    <p className="detail-copy">Use <code>{'{'}currentRow.columnName{'}'}</code> in nested steps. The current row can also be selected by Writer to update this row.</p>
                     <label>Read<select value={selectedStep.settings?.table_mode || 'row'} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, source: 'table', table_mode: event.target.value, iterator: event.target.value === 'row' ? 'row' : (current.settings?.column_name || 'value') } }))}>
                       <option value="row">each row</option><option value="column">one column value per row</option>
                     </select></label>
@@ -1590,6 +1741,10 @@ function StudioView({
                   <>
                     <p className="detail-copy">Define the columns to write. A missing table is created automatically; new columns are added to an existing table.</p>
                     <label>Table name<input value={selectedStep.settings?.table_name || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, table_name: event.target.value } }))} placeholder="events" /></label>
+                    <label>Current row (optional)<select value={selectedStep.settings?.current_row || ''} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, current_row: event.target.value } }))}>
+                      <option value="">Append a new row</option>
+                      <option value="currentRow">currentRow (from For each)</option>
+                    </select></label>
                     <div className="writer-table-actions">
                       <select value="" onChange={(event) => { if (event.target.value) loadWriterSchema(event.target.value) }} aria-label="Load existing table schema">
                         <option value="">Load existing table schema</option>
@@ -1598,6 +1753,7 @@ function StudioView({
                       <button className="secondary-button" type="button" onClick={() => loadWriterSchema()} disabled={writerSchemaLoading || !selectedStep.settings?.table_name?.trim()}>{writerSchemaLoading ? 'Loading…' : 'Load schema'}</button>
                       <button className="secondary-button" type="button" onClick={loadWriterTables}>Refresh</button>
                     </div>
+                    <label className="writer-duplicate-option"><input type="checkbox" checked={selectedStep.settings?.semantic_duplicate_removal === true} onChange={(event) => updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, semantic_duplicate_removal: event.target.checked } }))} /> Semantic duplicate removal</label>
                     {writerSchemaError && <div className="detail-error">{writerSchemaError}</div>}
                     <div className="writer-columns">
                       <div className="writer-columns-heading"><span>Write</span><span>Column</span><span>Type</span><span>Value / expression</span><span /></div>
@@ -1614,6 +1770,16 @@ function StudioView({
                       ))}
                     </div>
                     <button className="secondary-button" type="button" onClick={() => updateWriterColumns((columns) => [...columns, { name: '', type: 'TEXT', value: '', write: true }])}>+ Add column</button>
+                  </>
+                ) : [CALL_RECIPE_STEP_TYPE, INVOKE_RECIPE_STEP_TYPE].includes(selectedStep.type) ? (
+                  <>
+                    <p className="detail-copy">{selectedStep.type === INVOKE_RECIPE_STEP_TYPE ? 'Invoke a selected recipe in this position. Invokes run sequentially with the surrounding steps.' : 'Run another recipe from this project in the current browser session.'}</p>
+                    <label>Recipe<select value={selectedStep.settings?.recipe_id ? `id:${selectedStep.settings.recipe_id}` : (selectedStep.settings?.recipe_name ? `name:${selectedStep.settings.recipe_name}` : '')} onChange={(event) => {
+                      const target = (selectedStep.type === INVOKE_RECIPE_STEP_TYPE ? invokeRecipes : callableRecipes).find((recipe) => (recipe.id ? `id:${recipe.id}` : `name:${recipe.name}`) === event.target.value)
+                      updateStep(selectedStep.id, (current) => ({ ...current, settings: { ...current.settings, recipe_id: target?.id || '', recipe_name: target?.name || '' } }))
+                    }}>
+                      <option value="">Choose a recipe</option>{(selectedStep.type === INVOKE_RECIPE_STEP_TYPE ? invokeRecipes : callableRecipes).map((recipe) => <option key={recipe.localKey} value={recipe.id ? `id:${recipe.id}` : `name:${recipe.name}`}>{recipe.name}</option>)}
+                    </select></label>
                   </>
                 ) : (
                   <>
@@ -1632,6 +1798,14 @@ function StudioView({
                     <h3>{activeRecipe.name || 'Untitled recipe'}</h3>
                   </div>
                   <button className="back-to-view config-back" type="button" onClick={() => setRightMode('viewer')}>BACK TO VIEW</button>
+                </div>
+                <div className="config-section">
+                  <div className="section-label">Recipe type</div>
+                  <label><select value={activeRecipe.definition?.recipe_type || 'standard'} onChange={(event) => updateActiveRecipe((recipe) => ({ ...recipe, definition: { ...recipe.definition, recipe_type: event.target.value } }))}>
+                    <option value="standard">Standard</option>
+                    <option value="orchest">Orchest</option>
+                  </select></label>
+                  <p className="detail-copy">Orchest recipes can run other recipes from this project.</p>
                 </div>
                 <div className="config-section">
                   <div className="section-label">Variables</div>
@@ -1969,6 +2143,27 @@ function DataView() {
     }
   }
 
+  const deleteCraftTable = async () => {
+    const name = craftTable.trim()
+    if (!name || !window.confirm(`Delete table "${name}" and all its rows?`)) return
+    setSaving(true)
+    setError('')
+    try {
+      await api('/data/table', { method: 'DELETE', body: JSON.stringify({ table: name }) })
+      setCraftTable('')
+      setCraftColumns([{ name: 'value', type: 'TEXT' }])
+      setTableData(null)
+      setSelectedTable('')
+      setCraftMode('schema')
+      setNotice('Table deleted')
+      await loadTables(false)
+    } catch (reason) {
+      setError(reason.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   const selectTable = (table) => {
     setSelectedTable(table)
     setNotice('')
@@ -2024,6 +2219,24 @@ function DataView() {
     }
   }
 
+  const deleteDataRow = async (row) => {
+    if (!tableData || !row?.__sui_rowid || !window.confirm('Delete this row?')) return
+    setSaving(true)
+    setError('')
+    try {
+      const result = await api('/data/table/row', {
+        method: 'DELETE',
+        body: JSON.stringify({ table: tableData.table, row_id: row.__sui_rowid }),
+      })
+      setTableData(result)
+      setNotice('Row deleted')
+    } catch (reason) {
+      setError(reason.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   useEffect(() => {
     if (mode === 'craft' && selectedTable) loadCraftSchema(selectedTable)
   }, [mode])
@@ -2033,14 +2246,14 @@ function DataView() {
   return (
     <section className="page-section viewer-page data-page">
       <div className="section-heading viewer-heading">
-        <div><div className="eyebrow">DATA</div><h1>{mode === 'view' ? 'View' : 'Craft'}</h1><p>{mode === 'view' ? 'Inspect the tables created by your recipes.' : 'Create and shape local SQLite tables.'}</p></div>
+        <div><div className="eyebrow">DATA</div><h1>{mode === 'view' ? 'View' : 'Craft'}</h1><p>{mode === 'view' ? 'Inspect the tables created by your recipes.' : 'Create and shape data-tables.'}</p></div>
         <div className="data-mode-actions">
           <button className={mode === 'view' ? 'data-mode-button active' : 'data-mode-button'} type="button" onClick={() => setMode('view')}>View</button>
           <button className={mode === 'craft' ? 'data-mode-button active' : 'data-mode-button'} type="button" onClick={() => setMode('craft')}>Craft</button>
         </div>
       </div>
       {error && <div className="viewer-error-banner">{error}</div>}
-      {notice && <div className="viewer-notice">{notice}</div>}
+      {notice && <Toast message={notice} onClose={() => setNotice('')} />}
       <div className="viewer-layout">
         <aside className="viewer-table-list" aria-label="SQLite tables">
           <div className="viewer-list-header"><div className="viewer-list-label">TABLES</div><button className="mini-action" type="button" onClick={() => loadTables(false)}>↻</button></div>
@@ -2052,7 +2265,7 @@ function DataView() {
         <div className="viewer-table-content">
           {mode === 'craft' ? (
             <div className="craft-panel">
-              <div className="viewer-table-title craft-title"><div><div className="eyebrow">{craftMode === 'schema' ? 'TABLE DESIGN' : 'TABLE DATA'}</div><h2>{craftTable || 'New table'}</h2></div><div className="craft-header-actions"><div className="craft-edit-mode"><button type="button" className={craftMode === 'schema' ? 'craft-edit-button active' : 'craft-edit-button'} onClick={() => setCraftMode('schema')}>Schema Edit</button><button type="button" className={craftMode === 'data' ? 'craft-edit-button active' : 'craft-edit-button'} onClick={() => setCraftMode('data')}>Data Edit</button></div><button className="primary-button" type="button" onClick={saveCraftTable} disabled={saving}>{saving ? 'Saving…' : 'Save table'}</button></div></div>
+              <div className="viewer-table-title craft-title"><div><div className="eyebrow">{craftMode === 'schema' ? 'TABLE DESIGN' : 'TABLE DATA'}</div><h2>{craftTable || 'New table'}</h2></div><div className="craft-header-actions"><div className="craft-edit-mode"><button type="button" className={craftMode === 'schema' ? 'craft-edit-button active' : 'craft-edit-button'} onClick={() => setCraftMode('schema')}>Schema Edit</button><button type="button" className={craftMode === 'data' ? 'craft-edit-button active' : 'craft-edit-button'} onClick={() => setCraftMode('data')}>Data Edit</button></div><button className="primary-button" type="button" onClick={saveCraftTable} disabled={saving}>{saving ? 'Saving…' : 'Save table'}</button>{craftTable && <button className="danger-button" type="button" onClick={deleteCraftTable} disabled={saving}>Delete table</button>}</div></div>
               {craftMode === 'schema' ? (
                 <>
                   <label>Table name<input value={craftTable} onChange={(event) => setCraftTable(event.target.value)} placeholder="events" /></label>
@@ -2066,9 +2279,9 @@ function DataView() {
               ) : !tableData ? <div className="viewer-empty table-empty"><p>Save the table schema first, then add and edit rows here.</p></div> : (
                 <div className="craft-data-editor">
                   <div className="craft-data-toolbar"><span>Double-click a cell to edit it.</span><button className="secondary-button" type="button" onClick={startAddingRow} disabled={addingRow || saving}>+ Add row</button></div>
-                  <div className="viewer-data-wrap"><table className="viewer-data-table craft-data-table"><thead><tr>{tableData.columns.map((column) => <th key={column.name}>{column.name}<small>{column.type}</small></th>)}</tr></thead><tbody>
-                    {tableData.rows.map((row) => <tr key={`${tableData.table}-${row.__sui_rowid}`}>{tableData.columns.map((column) => { const value = row[column.name]; const display = value && typeof value === 'object' ? value.value : value; const cellKey = `${row.__sui_rowid}:${column.name}`; return <td key={column.name} title="Double-click to edit" onDoubleClick={() => { setEditingCell(cellKey); setError('') }}>{editingCell === cellKey ? <input className="craft-cell-input" autoFocus defaultValue={display == null ? '' : String(display)} onBlur={(event) => saveDataCell(row, column.name, event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') setEditingCell(null) }} /> : display == null ? '—' : String(display)}</td> })}</tr>)}
-                    {addingRow && <tr className="craft-new-row">{tableData.columns.map((column) => <td key={column.name}><input value={newRow[column.name] ?? ''} onChange={(event) => setNewRow((values) => ({ ...values, [column.name]: event.target.value }))} placeholder={column.name} /></td>)}</tr>}
+                  <div className="viewer-data-wrap"><table className="viewer-data-table craft-data-table"><thead><tr><th className="row-number-heading">#</th>{tableData.columns.map((column) => <th key={column.name}>{column.name}<small>{column.type}</small></th>)}<th className="craft-row-action-heading">Action</th></tr></thead><tbody>
+                    {tableData.rows.map((row, rowIndex) => <tr key={`${tableData.table}-${row.__sui_rowid}`}><td className="row-number">{rowIndex + 1}</td>{tableData.columns.map((column) => { const value = row[column.name]; const display = value && typeof value === 'object' ? value.value : value; const cellKey = `${row.__sui_rowid}:${column.name}`; return <td key={column.name} title="Double-click to edit" onDoubleClick={() => { setEditingCell(cellKey); setError('') }}>{editingCell === cellKey ? <input className="craft-cell-input" autoFocus defaultValue={display == null ? '' : String(display)} onBlur={(event) => saveDataCell(row, column.name, event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') setEditingCell(null) }} /> : display == null ? '—' : String(display)}</td> })}<td className="craft-row-action"><button type="button" className="craft-row-delete" onClick={() => deleteDataRow(row)} disabled={saving}>Delete</button></td></tr>)}
+                    {addingRow && <tr className="craft-new-row"><td className="row-number">—</td>{tableData.columns.map((column) => <td key={column.name}><input value={newRow[column.name] ?? ''} onChange={(event) => setNewRow((values) => ({ ...values, [column.name]: event.target.value }))} placeholder={column.name} /></td>)}<td className="craft-row-action">—</td></tr>}
                   </tbody></table></div>
                   {addingRow && <div className="craft-row-actions"><button className="primary-button" type="button" onClick={saveNewRow} disabled={saving}>{saving ? 'Saving…' : 'Save row'}</button><button className="secondary-button" type="button" onClick={() => setAddingRow(false)} disabled={saving}>Cancel</button></div>}
                   {!tableData.rows.length && !addingRow && <div className="viewer-empty table-empty"><p>This table has no rows yet. Add one to begin.</p></div>}
@@ -2080,7 +2293,7 @@ function DataView() {
               <div className="viewer-table-title"><div><div className="eyebrow">TABLE</div><h2>{tableData.table}</h2></div><span>{tableData.rows.length} row{tableData.rows.length === 1 ? '' : 's'}</span></div>
               <div className="viewer-schema">{tableData.columns.map((column) => <span key={column.name}><strong>{column.name}</strong><small>{column.type}</small></span>)}</div>
               <div className="viewer-data-wrap">
-                {tableData.rows.length ? <table className="viewer-data-table"><thead><tr>{tableData.columns.map((column) => <th key={column.name}>{column.name}</th>)}</tr></thead><tbody>{tableData.rows.map((row, index) => <tr key={`${tableData.table}-${index}`}>{tableData.columns.map((column) => { const value = row[column.name]; const display = value && typeof value === 'object' ? value.value : value; return <td key={column.name} title={display == null ? '' : String(display)}>{display == null ? '—' : String(display)}</td> })}</tr>)}</tbody></table> : <div className="viewer-empty table-empty"><p>This table has no rows.</p></div>}
+                {tableData.rows.length ? <table className="viewer-data-table"><thead><tr><th className="row-number-heading">#</th>{tableData.columns.map((column) => <th key={column.name}>{column.name}</th>)}</tr></thead><tbody>{tableData.rows.map((row, index) => <tr key={`${tableData.table}-${index}`}><td className="row-number">{index + 1}</td>{tableData.columns.map((column) => { const value = row[column.name]; const display = value && typeof value === 'object' ? value.value : value; return <td key={column.name} title={display == null ? '' : String(display)}>{display == null ? '—' : String(display)}</td> })}</tr>)}</tbody></table> : <div className="viewer-empty table-empty"><p>This table has no rows.</p></div>}
               </div>
             </>
           )}

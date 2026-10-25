@@ -36,6 +36,8 @@ SUPPORTED_STEP_TYPES = {
     "keypress",
     "assign",
     "scrape",
+    "pattern_matcher",
+    "smartie",
     "message_box",
     "check_element_exists",
     "check_text_exists",
@@ -43,6 +45,8 @@ SUPPORTED_STEP_TYPES = {
     "for",
     "use_js",
     "writer",
+    "call_recipe",
+    "invoke_recipe",
 }
 WRITER_COLUMN_TYPES = {"TEXT", "INTEGER", "REAL", "BLOB", "BOOLEAN", "DATE", "DATETIME"}
 INTERNAL_SQLITE_TABLES = {"projects", "recipes", "recipe_versions", "jobs", "job_logs"}
@@ -52,6 +56,31 @@ KEYPRESS_KEYS = {
     "PageUp", "PageDown", "Insert", "Control", "Shift", "Alt", "Meta",
     *(f"F{index}" for index in range(1, 13)),
 }
+
+
+def load_env_file() -> None:
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, value = stripped.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name or name in os.environ:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ[name] = value
+
+
+load_env_file()
 STEP_RUNS: dict[str, dict[str, Any]] = {}
 STEP_RUNS_LOCK = threading.Lock()
 STEP_RUNS_CHANGED = threading.Condition(STEP_RUNS_LOCK)
@@ -215,6 +244,13 @@ def validate_navigation_action(value: Any) -> str:
     return action
 
 
+def validate_recipe_type(value: Any) -> str:
+    recipe_type = str(value or "standard").strip().lower()
+    if recipe_type not in {"standard", "orchest"}:
+        raise ValueError("Recipe type must be standard or orchest")
+    return recipe_type
+
+
 def validate_condition_operator(value: Any) -> str:
     operator = str(value or "=").strip()
     if operator not in {"=", "<>", "<", "<=", ">", ">=", "in"}:
@@ -286,6 +322,76 @@ def normalize_writer_columns(settings: dict[str, Any]) -> list[dict[str, Any]]:
             "write": bool(raw_column.get("write", True)),
         })
     return columns
+
+
+def normalize_writer_duplicate_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    enabled = bool(settings.get("semantic_duplicate_removal", False))
+    raw_threshold = settings.get("duplicate_threshold", 0.88)
+    try:
+        threshold = float(raw_threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Writer duplicate threshold must be a number") from exc
+    if not 0.5 <= threshold <= 1.0:
+        raise ValueError("Writer duplicate threshold must be between 0.5 and 1")
+    return {
+        "semantic_duplicate_removal": enabled,
+        "duplicate_threshold": threshold,
+    }
+
+
+SMARTIE_OUTPUT_TYPES = {"text", "number", "json"}
+SMARTIE_FIELD_TYPES = {"string", "number", "boolean", "json"}
+SMARTIE_MODELS = {"gemini-2.5-flash"}
+
+
+def normalize_smartie_schema(settings: dict[str, Any]) -> dict[str, Any]:
+    model = str(settings.get("model") or "gemini-2.5-flash").strip()
+    # Gemini 2.0 Flash has been retired by the API. Migrate saved recipes
+    # created before the model was retired when they are normalized again.
+    if model == "gemini-2.0-flash":
+        model = "gemini-2.5-flash"
+    if model not in SMARTIE_MODELS:
+        raise ValueError("Unsupported Smartie Gemini model")
+    output_type = str(settings.get("output_type") or "text").strip().lower()
+    if output_type not in SMARTIE_OUTPUT_TYPES:
+        raise ValueError("Smartie output must be text, number, or json")
+    output_variable = validate_variable_name(settings.get("output_variable"))
+    system_prompt = str(settings.get("system_prompt") or "")
+    user_prompt = str(settings.get("user_prompt") or "")
+    if not user_prompt.strip():
+        raise ValueError("Smartie requires a user prompt")
+    raw_fields = settings.get("schema") or []
+    if output_type != "json":
+        raw_fields = []
+    if not isinstance(raw_fields, list):
+        raise ValueError("Smartie JSON schema must be an array")
+    fields: list[dict[str, Any]] = []
+    field_names: set[str] = set()
+    for raw_field in raw_fields:
+        if not isinstance(raw_field, dict):
+            raise ValueError("Smartie JSON schema fields must be objects")
+        name = str(raw_field.get("name") or "").strip()
+        if not name or len(name) > 100:
+            raise ValueError("Smartie JSON schema field names must be non-empty")
+        name_key = name.casefold()
+        if name_key in field_names:
+            raise ValueError(f"Smartie JSON schema field {name} is duplicated")
+        field_names.add(name_key)
+        field_type = str(raw_field.get("type") or "string").strip().lower()
+        if field_type not in SMARTIE_FIELD_TYPES:
+            raise ValueError("Smartie JSON schema field types must be string, number, boolean, or json")
+        fields.append({"name": name, "type": field_type, "required": bool(raw_field.get("required", True))})
+    if output_type == "json" and not fields:
+        raise ValueError("Smartie JSON output requires at least one schema field")
+    return {
+        "provider": "google_gemini",
+        "model": model,
+        "system_prompt": system_prompt,
+        "user_prompt": user_prompt,
+        "output_type": output_type,
+        "output_variable": output_variable,
+        "schema": fields,
+    }
 
 
 def quote_sqlite_identifier(value: str) -> str:
@@ -393,6 +499,17 @@ def data_table_row(table_name: str, operation: str, raw_values: Any = None, row_
             )
             if result.rowcount != 1:
                 raise ValueError("Row not found")
+        elif operation == "delete":
+            try:
+                numeric_row_id = int(row_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("A valid row is required") from exc
+            result = connection.execute(
+                f"DELETE FROM {quoted_table} WHERE rowid = ?",
+                (numeric_row_id,),
+            )
+            if result.rowcount != 1:
+                raise ValueError("Row not found")
         else:
             raise ValueError("Unsupported data operation")
         connection.commit()
@@ -444,19 +561,22 @@ def craft_table(table_name: str, raw_columns: Any) -> dict[str, Any]:
                 and normalize_existing_sqlite_type(existing[column_name.casefold()]["type"]) != column_type
                 for column_name, column_type, _ in columns
             )
-            if type_changes and desired_names == current_names and not any(bool(row["pk"]) for row in existing.values()):
+            schema_changed = desired_names != current_names or type_changes
+            if schema_changed and not any(bool(row["pk"]) for row in existing.values()):
                 temporary_name = f"__sui_craft_{uuid.uuid4().hex}"
                 temporary_table = quote_sqlite_identifier(temporary_name)
                 definitions = ", ".join(f"{quote_sqlite_identifier(column_name)} {column_type}" for column_name, column_type, _ in columns)
                 connection.execute(f"CREATE TABLE {temporary_table} ({definitions})")
                 common = [(column_name, column_type) for column_name, column_type, _ in columns if column_name.casefold() in existing]
-                names = ", ".join(quote_sqlite_identifier(column_name) for column_name, _ in common)
-                casts = ", ".join(f"CAST({quote_sqlite_identifier(column_name)} AS {column_type})" for column_name, column_type in common)
                 if common:
+                    names = ", ".join(quote_sqlite_identifier(column_name) for column_name, _ in common)
+                    casts = ", ".join(f"CAST({quote_sqlite_identifier(column_name)} AS {column_type})" for column_name, column_type in common)
                     connection.execute(f"INSERT INTO {temporary_table} ({names}) SELECT {casts} FROM {quoted_table}")
                 connection.execute(f"DROP TABLE {quoted_table}")
                 connection.execute(f"ALTER TABLE {temporary_table} RENAME TO {quote_sqlite_identifier(name)}")
                 existing = {column_name.casefold(): {"name": column_name, "type": column_type, "pk": 0} for column_name, column_type, _ in columns}
+            elif schema_changed and any(bool(row["pk"]) for row in existing.values()):
+                raise ValueError("Craft cannot remove or change columns on a table with a primary key")
             for column_name, column_type, _ in columns:
                 if column_name.casefold() not in existing:
                     connection.execute(f"ALTER TABLE {quoted_table} ADD COLUMN {quote_sqlite_identifier(column_name)} {column_type}")
@@ -464,6 +584,24 @@ def craft_table(table_name: str, raw_columns: Any) -> dict[str, Any]:
     finally:
         connection.close()
     return {"table": name, "columns": writer_table_schema(name), "created": created}
+
+
+def delete_data_table(table_name: str) -> str:
+    name = validate_table_name(table_name)
+    if name in INTERNAL_SQLITE_TABLES or name.startswith("sqlite_"):
+        raise ValueError("That table is reserved by Sui")
+    connection = db_connection()
+    try:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        if not exists:
+            raise ValueError("Data table not found")
+        connection.execute(f"DROP TABLE {quote_sqlite_identifier(name)}")
+        connection.commit()
+    finally:
+        connection.close()
+    return name
 
 
 def writer_table_schema(table_name: str) -> list[dict[str, Any]]:
@@ -546,7 +684,8 @@ def normalize_definition(
     raw_steps = definition.get("steps", [])
     if not isinstance(raw_steps, list):
         raise ValueError("Recipe steps must be an array")
-    if require_first_navigation and raw_steps:
+    recipe_type = validate_recipe_type(definition.get("recipe_type", "standard"))
+    if require_first_navigation and recipe_type != "orchest" and raw_steps:
         first_step = raw_steps[0]
         if not isinstance(first_step, dict) or str(first_step.get("type") or "") != "navigate_to_website":
             raise ValueError("The first recipe step must be Navigate to website")
@@ -624,6 +763,33 @@ def normalize_definition(
                     "selector": validate_selector(settings.get("selector")),
                     "variable": variable_name,
                 }
+            elif step_type == "pattern_matcher":
+                variable_name = validate_variable_name(settings.get("variable"))
+                if variable_name not in variable_names:
+                    raise ValueError(f"Pattern Matcher refers to unknown variable {variable_name}")
+                raw_patterns = settings.get("patterns") or []
+                if not isinstance(raw_patterns, list):
+                    raise ValueError("Pattern Matcher patterns must be an array")
+                patterns: list[str] = []
+                for raw_pattern in raw_patterns:
+                    pattern = str(raw_pattern or "").strip()
+                    if not pattern:
+                        continue
+                    try:
+                        re.compile(pattern)
+                    except re.error as exc:
+                        raise ValueError(f"Invalid Pattern Matcher regex: {exc}") from exc
+                    patterns.append(pattern)
+                if not patterns:
+                    raise ValueError("Pattern Matcher requires at least one regex pattern")
+                normalized_settings = {
+                    "patterns": patterns,
+                    "variable": variable_name,
+                }
+            elif step_type == "smartie":
+                normalized_settings = normalize_smartie_schema(settings)
+                if normalized_settings["output_variable"] not in available_variable_names:
+                    raise ValueError(f"Smartie output refers to unknown variable {normalized_settings['output_variable']}")
             elif step_type == "message_box":
                 normalized_settings = {"message": str(settings.get("message") or "")}
             elif step_type == "check_element_exists":
@@ -661,6 +827,7 @@ def normalize_definition(
                         "table_name": table_name,
                         "iterator": iterator,
                         "column_name": validate_writer_column_name(settings.get("column_name") or iterator) if table_mode == "column" else "",
+                        "current_row": "currentRow",
                     }
                 else:
                     iterator, inline_start = normalize_loop_iterator(settings.get("iterator", "i"))
@@ -694,10 +861,30 @@ def normalize_definition(
                 }
             elif step_type == "writer":
                 columns = normalize_writer_columns(settings)
+                current_row_reference = str(settings.get("current_row") or "").strip()
+                if current_row_reference:
+                    current_row_reference = normalize_variable_reference(current_row_reference)
+                    if current_row_reference != "currentRow":
+                        raise ValueError("Writer current row must use currentRow")
                 normalized_settings = {
                     "value": str(settings.get("value") or ""),
                     "table_name": validate_table_name(settings.get("table_name")),
                     "columns": columns,
+                    "current_row": current_row_reference,
+                    **normalize_writer_duplicate_settings(settings),
+                }
+            elif step_type in {"call_recipe", "invoke_recipe"}:
+                if recipe_type != "orchest":
+                    raise ValueError("Run recipe and Invoke are available only for orchest recipes")
+                target_recipe_id = str(settings.get("recipe_id") or "").strip()
+                target_recipe_name = str(settings.get("recipe_name") or "").strip()
+                if not target_recipe_id and not target_recipe_name:
+                    raise ValueError("Invoke requires a target recipe")
+                if target_recipe_id == recipe_id:
+                    raise ValueError("A recipe cannot run itself")
+                normalized_settings = {
+                    "recipe_id": target_recipe_id,
+                    "recipe_name": target_recipe_name,
                 }
             else:
                 normalized_settings = {"selector": validate_selector(settings.get("selector"))}
@@ -717,6 +904,8 @@ def normalize_definition(
             elif step_type == "for":
                 loop_variable_names = set(available_variable_names)
                 loop_variable_names.add(normalized_settings["iterator"])
+                if normalized_settings.get("source") == "table":
+                    loop_variable_names.add("currentRow")
                 branches = {
                     "body": normalize_steps(raw_branches.get("body", []), "for loop body", loop_variable_names),
                 }
@@ -793,6 +982,7 @@ def normalize_definition(
         "project_id": project_id,
         "recipe_id": recipe_id,
         "recipe_name": recipe_name,
+        "recipe_type": recipe_type,
         "version": version,
         "steps": steps,
         "connections": definition.get("connections") or [],
@@ -853,8 +1043,97 @@ def _generated_window_support(lines: list[str]) -> None:
     )
 
 
+def _generated_smartie_support(lines: list[str]) -> None:
+    lines.extend(
+        [
+            "def smartie_env_value(name):",
+            "    value = os.environ.get(name, '').strip()",
+            "    if value: return value",
+            "    env_path = os.path.join(os.path.dirname(os.path.abspath(WRITER_DB_PATH)), '..', '.env')",
+            "    try:",
+            "        with open(env_path, 'r', encoding='utf-8') as handle:",
+            "            for raw_line in handle:",
+            "                line = raw_line.strip()",
+            "                if not line or line.startswith('#') or '=' not in line: continue",
+            "                key, candidate = line.split('=', 1)",
+            "                if key.strip() == name:",
+            "                    candidate = candidate.strip()",
+            "                    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in chr(39) + chr(34): candidate = candidate[1:-1]",
+            "                    return candidate",
+            "    except OSError: pass",
+            "    return ''",
+            "",
+            "",
+            "def smartie_response_text(payload):",
+            "    candidates = payload.get('candidates') or []",
+            "    if not candidates: raise RuntimeError('Gemini returned no candidates')",
+            "    content = candidates[0].get('content') or {}",
+            "    parts = content.get('parts') or []",
+            "    text = ''.join(str(part.get('text') or '') for part in parts).strip()",
+            "    if not text: raise RuntimeError('Gemini returned an empty response')",
+            "    return text",
+            "",
+            "",
+            "def smartie_json_schema(fields):",
+            "    type_map = {'string': 'STRING', 'number': 'NUMBER', 'boolean': 'BOOLEAN', 'json': 'OBJECT'}",
+            "    properties = {}",
+            "    required = []",
+            "    for field in fields or []:",
+            "        field_name = str(field.get('name') or '')",
+            "        properties[field_name] = {'type': type_map.get(str(field.get('type') or 'string'), 'STRING')}",
+            "        if field.get('required', True): required.append(field_name)",
+            "    return {'type': 'OBJECT', 'properties': properties, 'required': required}",
+            "",
+            "",
+            "def run_smartie(model, system_prompt, user_prompt, output_type, output_schema):",
+            "    api_key = smartie_env_value('GOOGLE_GEMINI_KEY')",
+            "    if not api_key: raise RuntimeError('Smartie requires GOOGLE_GEMINI_KEY in .env')",
+            "    model = str(model or 'gemini-2.5-flash')",
+            "    if model == 'gemini-2.0-flash': model = 'gemini-2.5-flash'",
+            "    endpoint = 'https://generativelanguage.googleapis.com/v1beta/models/' + quote(model, safe='') + ':generateContent'",
+            "    request_body = {'contents': [{'role': 'user', 'parts': [{'text': str(user_prompt)}]}]}",
+            "    if str(system_prompt or '').strip(): request_body['systemInstruction'] = {'parts': [{'text': str(system_prompt)}]}",
+            "    if output_type == 'json': request_body['generationConfig'] = {'responseMimeType': 'application/json', 'responseSchema': smartie_json_schema(output_schema)}",
+            "    request = urllib.request.Request(endpoint, data=json.dumps(request_body, ensure_ascii=False).encode('utf-8'), headers={'Content-Type': 'application/json', 'x-goog-api-key': api_key}, method='POST')",
+            "    try:",
+            "        with urllib.request.urlopen(request, timeout=120) as response: payload = json.loads(response.read().decode('utf-8'))",
+            "    except urllib.error.HTTPError as exc:",
+            "        detail = exc.read().decode('utf-8', errors='replace')",
+            "        try:",
+            "            error_payload = json.loads(detail).get('error') or {}",
+            "            error_message = str(error_payload.get('message') or detail).replace(chr(10), ' ').replace(chr(13), ' ').strip()",
+            "            error_reason = str(error_payload.get('status') or error_payload.get('details', [{}])[0].get('reason') or '').strip()",
+            "            if error_reason: error_message += ' [' + error_reason + ']'",
+            "        except (TypeError, ValueError, json.JSONDecodeError): error_message = detail.replace(chr(10), ' ').replace(chr(13), ' ').strip()",
+            "        raise RuntimeError('Gemini request failed (' + str(exc.code) + '): ' + error_message[:1000]) from exc",
+            "    text = smartie_response_text(payload)",
+            "    if output_type == 'number':",
+            "        candidate = text.strip().replace(',', '')",
+            "        try: return int(candidate) if re.fullmatch(r'[-+]?\\d+', candidate) else float(candidate)",
+            "        except ValueError:",
+            "            match = re.search(r'[-+]?(?:\\d+\\.\\d+|\\d+)', candidate)",
+            "            if not match: raise RuntimeError('Smartie expected a number but Gemini returned: ' + text[:300])",
+            "            return float(match.group(0))",
+            "    if output_type == 'json':",
+            "        cleaned = text.strip()",
+            "        if cleaned.startswith('```'): cleaned = re.sub(r'^```(?:json)?\\s*|\\s*```$', '', cleaned, flags=re.IGNORECASE | re.DOTALL).strip()",
+            "        try: parsed = json.loads(cleaned)",
+            "        except json.JSONDecodeError as exc: raise RuntimeError('Smartie returned invalid JSON: ' + str(exc)) from exc",
+            "        if not isinstance(parsed, dict): raise RuntimeError('Smartie JSON output must be an object')",
+            "        missing = [str(field.get('name')) for field in output_schema if field.get('required', True) and str(field.get('name')) not in parsed]",
+            "        if missing: raise RuntimeError('Smartie JSON output is missing fields: ' + ', '.join(missing))",
+            "        return json.dumps(parsed, ensure_ascii=False, separators=(',', ':'))",
+            "    return text",
+            "",
+            "",
+        ]
+    )
+
+
 def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
     mode = definition.get("mode") or "headful"
+    project_id_literal = json.dumps(str(definition.get("project_id") or ""))
+    recipe_id_literal = json.dumps(str(definition.get("recipe_id") or ""))
     steps_literal = json.dumps(json.dumps(definition.get("steps", [])))
     variables_literal = json.dumps(json.dumps({item["name"]: item.get("value", "") for item in definition.get("variables", [])}))
     writer_db_literal = json.dumps(str(DB_PATH))
@@ -862,11 +1141,15 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "import base64",
         "import ast",
         "import ctypes",
+        "import difflib",
         "import json",
         "import os",
         "import re",
         "import sqlite3",
         "import time",
+        "import urllib.error",
+        "import urllib.request",
+        "from urllib.parse import quote",
         "from rustwright.sync_api import sync_playwright",
         "",
         "",
@@ -914,8 +1197,30 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "",
         f"WRITER_DB_PATH = {writer_db_literal}",
         "",
+    ]
+    _generated_smartie_support(lines)
+    lines.extend([
         "",
-        "def write_values_to_sqlite(table_name, columns):",
+        "def semantic_row_text(row):",
+        "    return ' '.join(str(row.get(key) or '').casefold() for key in sorted(row))",
+        "",
+        "",
+        "def semantic_row_similarity(left, right):",
+        "    left_text, right_text = semantic_row_text(left), semantic_row_text(right)",
+        "    if not left_text or not right_text: return 0.0",
+        "    sequence_score = difflib.SequenceMatcher(None, left_text, right_text).ratio()",
+        "    left_tokens = set(re.findall(r'\\w+', left_text, re.UNICODE))",
+        "    right_tokens = set(re.findall(r'\\w+', right_text, re.UNICODE))",
+        "    token_score = len(left_tokens & right_tokens) / max(len(left_tokens | right_tokens), 1)",
+        "    return max(sequence_score, token_score)",
+        "",
+        "",
+        "def record_semantic_duplicate(connection, source_table, incoming_row, existing_row, similarity):",
+        "    connection.execute('CREATE TABLE IF NOT EXISTS \\\"duplicates\\\" (id INTEGER PRIMARY KEY AUTOINCREMENT, source_table TEXT NOT NULL, incoming_row TEXT NOT NULL, existing_row TEXT NOT NULL, similarity REAL NOT NULL, created_at TEXT NOT NULL)')",
+        "    connection.execute('INSERT INTO \\\"duplicates\\\" (source_table, incoming_row, existing_row, similarity, created_at) VALUES (?, ?, ?, ?, ?)', (str(source_table), json.dumps(incoming_row, ensure_ascii=True, default=str), json.dumps(existing_row, ensure_ascii=True, default=str), float(similarity), time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))",
+        "",
+        "",
+        "def write_values_to_sqlite(table_name, columns, semantic_duplicate_removal=False, duplicate_threshold=0.88, current_row=None):",
         "    if not str(table_name or '').strip() or chr(0) in str(table_name): raise ValueError('Writer requires a valid table name')",
         "    normalized = []",
         "    for column in columns or []:",
@@ -936,6 +1241,30 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "            for name, column_type, _ in normalized:",
         "                if name not in existing: connection.execute(f'ALTER TABLE {quoted_table} ADD COLUMN {chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34)} {column_type}')",
         "        writable = [(name, column) for name, _, column in normalized if column.get('write', True)]",
+        "        row_updates = [(name, column) for name, column in writable if str(column.get('value') or '') != '']",
+        "        has_current_row = isinstance(current_row, dict) and current_row.get('__sui_table') == str(table_name) and current_row.get('__sui_rowid') not in (None, '')",
+        "        if has_current_row and row_updates:",
+        "            assignments = ', '.join(chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34) + ' = ?' for name, _ in row_updates)",
+        "            values = tuple(str(column.get('value') or '') for _, column in row_updates)",
+        "            connection.execute(f'UPDATE {quoted_table} SET {assignments} WHERE rowid = ?', values + (int(current_row.get('__sui_rowid')),))",
+        "            connection.commit()",
+        "            return {'updated': True}",
+        "        if has_current_row:",
+        "            connection.commit()",
+        "            return {'updated': False, 'skipped': True}",
+        "        if semantic_duplicate_removal and writable:",
+        "            incoming_row = {name: column.get('value') for name, column in writable}",
+        "            connection.row_factory = sqlite3.Row",
+        "            candidates = connection.execute(f'SELECT * FROM {quoted_table}').fetchall()",
+        "            best_match, best_score = None, 0.0",
+        "            for candidate in candidates:",
+        "                candidate_row = {name: candidate[name] for name, _ in writable}",
+        "                score = semantic_row_similarity(incoming_row, candidate_row)",
+        "                if score > best_score: best_match, best_score = dict(candidate), score",
+        "            if best_match is not None and best_score >= float(duplicate_threshold):",
+        "                record_semantic_duplicate(connection, table_name, incoming_row, best_match, best_score)",
+        "                connection.commit()",
+        "                return {'duplicate': True, 'similarity': best_score}",
         "        if writable:",
         "            names = ', '.join(chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34) for name, _ in writable)",
         "            placeholders = ', '.join('?' for _ in writable)",
@@ -953,8 +1282,7 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "    connection = sqlite3.connect(WRITER_DB_PATH)",
         "    connection.row_factory = sqlite3.Row",
         "    try:",
-        "        if column: return [row[0] for row in connection.execute(f'SELECT {quote(column)} FROM {quote(table)}').fetchall()]",
-        "        return [dict(row) for row in connection.execute(f'SELECT * FROM {quote(table)}').fetchall()]",
+        "        return [dict(row) for row in connection.execute(f'SELECT rowid AS __sui_rowid, * FROM {quote(table)}').fetchall()]",
         "    finally:",
         "        connection.close()",
         "",
@@ -983,15 +1311,37 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "    return page.locator(value)",
         "",
         "",
+        "def is_frame_transition_error(exc):",
+        "    message = str(exc).lower()",
+        "    return any(marker in message for marker in (",
+        "        'frame ownership changed', 'execution context was destroyed',",
+        "        'cannot find context with specified id', 'context was destroyed',",
+        "    ))",
+        "",
+        "",
         "def wait_for_locator(page, selector, action, timeout_ms=30000):",
         "    value = str(selector or '').strip()",
         "    if not value: raise ValueError(action + ' requires a selector')",
-        "    locator = locator_for(page, value).first",
-        "    try:",
-        "        locator.wait_for(state='attached' if str(action).lower() == 'scrape' else 'visible', timeout=timeout_ms)",
-        "    except Exception as exc:",
-        "        raise RuntimeError(action + ' target not found for selector ' + repr(value)) from exc",
-        "    return locator",
+        "    deadline = time.monotonic() + max(float(timeout_ms), 1) / 1000.0",
+        "    while True:",
+        "        try:",
+        "            locator = locator_for(page, value).first",
+        "            remaining_ms = max(100, int((deadline - time.monotonic()) * 1000))",
+        "            locator.wait_for(state='attached' if str(action).lower() == 'scrape' else 'visible', timeout=remaining_ms)",
+        "            return locator",
+        "        except Exception as exc:",
+        "            if not is_frame_transition_error(exc) or time.monotonic() >= deadline:",
+        "                raise RuntimeError(action + ' target not found for selector ' + repr(value)) from exc",
+        "            time.sleep(0.10)",
+        "",
+        "",
+        "def page_body_text(page, timeout_seconds=30):",
+        "    deadline = time.monotonic() + max(float(timeout_seconds), 0.1)",
+        "    while True:",
+        "        try: return page.locator('body').inner_text()",
+        "        except Exception as exc:",
+        "            if not is_frame_transition_error(exc) or time.monotonic() >= deadline: raise",
+        "            time.sleep(0.10)",
         "",
         "",
         "def page_url(page):",
@@ -1083,8 +1433,41 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "",
         f"recipe_steps = json.loads({steps_literal})",
         f"variables = json.loads({variables_literal})",
+        f"ORCHESTRATOR_PROJECT_ID = {project_id_literal}",
+        f"CALL_STACK = [{recipe_id_literal}]",
         "PAGE_OPENERS = {}",
         "PAGE_SOURCES = {}",
+        "",
+        "",
+        "def load_called_recipe(settings):",
+        "    target_id = str(settings.get('recipe_id') or '').strip()",
+        "    target_name = str(settings.get('recipe_name') or '').strip()",
+        "    connection = sqlite3.connect(WRITER_DB_PATH)",
+        "    try:",
+        "        if target_id:",
+        "            row = connection.execute(\"SELECT rv.definition_json FROM recipe_versions rv JOIN recipes r ON r.id = rv.recipe_id WHERE r.project_id = ? AND r.id = ? ORDER BY rv.version DESC LIMIT 1\", (ORCHESTRATOR_PROJECT_ID, target_id)).fetchone()",
+        "        else:",
+        "            row = connection.execute(\"SELECT rv.definition_json FROM recipe_versions rv JOIN recipes r ON r.id = rv.recipe_id WHERE r.project_id = ? AND r.name = ? ORDER BY rv.version DESC LIMIT 1\", (ORCHESTRATOR_PROJECT_ID, target_name)).fetchone()",
+        "    finally:",
+        "        connection.close()",
+        "    if not row: raise ValueError('Target recipe was not found in this project')",
+        "    return json.loads(row[0])",
+        "",
+        "",
+        "def run_called_recipe(page, settings):",
+        "    target = load_called_recipe(settings)",
+        "    target_id = str(target.get('recipe_id') or '')",
+        "    if target_id in CALL_STACK: raise ValueError('Recursive recipe calls are not allowed')",
+        "    previous_variables = dict(variables)",
+        "    variables.clear()",
+        "    variables.update({item.get('name'): item.get('value', '') for item in target.get('variables', []) if item.get('name')})",
+        "    CALL_STACK.append(target_id)",
+        "    try:",
+        "        return execute_steps(page, target.get('steps') or [])",
+        "    finally:",
+        "        CALL_STACK.pop()",
+        "        variables.clear()",
+        "        variables.update(previous_variables)",
         "",
         "",
         "def execute_step(page, step):",
@@ -1138,10 +1521,18 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "        variables[settings.get('variable')] = resolve(settings.get('value'), variables); human_pause(0.25)",
         "    elif step_type == 'scrape':",
         "        variables[settings.get('variable')] = wait_for_locator(page, resolve(settings.get('selector'), variables), 'Scrape').inner_text(); human_pause(0.30)",
+        "    elif step_type == 'pattern_matcher':",
+        "        source = page_body_text(page); combined_pattern = '|'.join('(?:' + str(pattern) + ')' for pattern in (settings.get('patterns') or []))",
+        "        matches = [candidate.group(0) for candidate in re.finditer(combined_pattern, source, re.IGNORECASE)] if combined_pattern else []",
+        "        variables[settings.get('variable')] = ' | '.join(matches) if matches else 'NO CONTACTS FOUND'; human_pause(0.30)",
+        "    elif step_type == 'smartie':",
+        "        smartie_system = resolve(settings.get('system_prompt'), variables); smartie_user = resolve(settings.get('user_prompt'), variables); variables[settings.get('output_variable')] = run_smartie(settings.get('model', 'gemini-2.5-flash'), smartie_system, smartie_user, settings.get('output_type', 'text'), settings.get('schema') or []); human_pause(0.30)",
         "    elif step_type == 'message_box':",
         f"        show_message_box(page, resolve(settings.get('message'), variables)); page.locator('#sui-message-box-ok').click() if {json.dumps(mode)} == 'headless' else page.wait_for_function(\"() => !document.getElementById('sui-message-box')\")",
         "    elif step_type == 'writer':",
-        "        writer_columns = [dict(column, value=resolve(column.get('value'), variables)) for column in (settings.get('columns') or [{'name': 'value', 'type': 'TEXT', 'value': settings.get('value', ''), 'write': True}])]; write_values_to_sqlite(settings.get('table_name'), writer_columns); human_pause(0.25)",
+        "        writer_columns = [dict(column, value=resolve(column.get('value'), variables)) for column in (settings.get('columns') or [{'name': 'value', 'type': 'TEXT', 'value': settings.get('value', ''), 'write': True}])]; current_row = variables.get(settings.get('current_row')) if settings.get('current_row') else None; write_values_to_sqlite(settings.get('table_name'), writer_columns, settings.get('semantic_duplicate_removal', False), settings.get('duplicate_threshold', 0.88), current_row); human_pause(0.25)",
+        "    elif step_type in {'call_recipe', 'invoke_recipe'}:",
+        "        page = run_called_recipe(page, settings); human_pause(0.25)",
         "    elif step_type == 'check_element_exists':",
         "        selector = resolve(settings.get('selector'), variables); locator = locator_for(page, selector)",
         "        try:",
@@ -1152,7 +1543,7 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "    elif step_type == 'check_text_exists':",
         "        expected = resolve(settings.get('text'), variables); timeout = float(settings.get('timeout_seconds', 5)); deadline = time.monotonic() + timeout; exists = False",
         "        while time.monotonic() < deadline:",
-        "            body = page.locator('body').inner_text(); exists = expected.lower() in body.lower() if settings.get('case_insensitive', True) else expected in body",
+        "            body = page_body_text(page, max(0.1, deadline - time.monotonic())); exists = expected.lower() in body.lower() if settings.get('case_insensitive', True) else expected in body",
         "            if exists: break",
         "            time.sleep(0.2)",
         "        page = execute_steps(page, (step.get('branches') or {}).get('exists' if exists else 'not_exists', []))",
@@ -1166,7 +1557,8 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "            if loop_count < 0: raise ValueError('For loop range must not be negative')",
         "            loop_iterable = ((loop_index, loop_index) for loop_index in range(loop_start, loop_start + loop_count))",
         "        for loop_index, loop_value in loop_iterable:",
-        "            variables[iterator] = loop_value",
+        "            variables[iterator] = loop_value.get(column_name) if settings.get('source') == 'table' and table_mode == 'column' else loop_value",
+        "            variables['currentRow'] = dict(loop_value, __sui_table=table_name) if settings.get('source') == 'table' and isinstance(loop_value, dict) else variables.get('currentRow')",
         "            print(f\"SUI_LOG:For loop iteration {loop_index} started\", flush=True)",
         "            try:",
         "                page = execute_steps(page, (step.get('branches') or {}).get('body', []))",
@@ -1199,7 +1591,7 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "    return page",
         "",
         "",
-    ]
+    ])
     _generated_window_support(lines)
     lines.extend(
         [
@@ -1451,6 +1843,8 @@ def generate_python(definition: dict[str, Any]) -> str:
 
 def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
     mode = definition.get("mode") or "headful"
+    project_id_literal = json.dumps(str(definition.get("project_id") or ""))
+    recipe_id_literal = json.dumps(str(definition.get("recipe_id") or ""))
     step_literal = json.dumps(json.dumps((definition.get("steps") or [{}])[0]))
     variables_literal = json.dumps(json.dumps({item["name"]: item.get("value", "") for item in definition.get("variables", [])}))
     writer_db_literal = json.dumps(str(DB_PATH))
@@ -1459,12 +1853,16 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "import ast",
         "import base64",
         "import ctypes",
+        "import difflib",
         "import json",
         "import os",
         "import re",
         "import sqlite3",
         "import sys",
         "import time",
+        "import urllib.error",
+        "import urllib.request",
+        "from urllib.parse import quote",
         "from rustwright.async_api import async_playwright",
         "",
         "",
@@ -1512,8 +1910,30 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "",
         f"WRITER_DB_PATH = {writer_db_literal}",
         "",
+    ]
+    _generated_smartie_support(lines)
+    lines.extend([
         "",
-        "def write_values_to_sqlite(table_name, columns):",
+        "def semantic_row_text(row):",
+        "    return ' '.join(str(row.get(key) or '').casefold() for key in sorted(row))",
+        "",
+        "",
+        "def semantic_row_similarity(left, right):",
+        "    left_text, right_text = semantic_row_text(left), semantic_row_text(right)",
+        "    if not left_text or not right_text: return 0.0",
+        "    sequence_score = difflib.SequenceMatcher(None, left_text, right_text).ratio()",
+        "    left_tokens = set(re.findall(r'\\w+', left_text, re.UNICODE))",
+        "    right_tokens = set(re.findall(r'\\w+', right_text, re.UNICODE))",
+        "    token_score = len(left_tokens & right_tokens) / max(len(left_tokens | right_tokens), 1)",
+        "    return max(sequence_score, token_score)",
+        "",
+        "",
+        "def record_semantic_duplicate(connection, source_table, incoming_row, existing_row, similarity):",
+        "    connection.execute('CREATE TABLE IF NOT EXISTS \\\"duplicates\\\" (id INTEGER PRIMARY KEY AUTOINCREMENT, source_table TEXT NOT NULL, incoming_row TEXT NOT NULL, existing_row TEXT NOT NULL, similarity REAL NOT NULL, created_at TEXT NOT NULL)')",
+        "    connection.execute('INSERT INTO \\\"duplicates\\\" (source_table, incoming_row, existing_row, similarity, created_at) VALUES (?, ?, ?, ?, ?)', (str(source_table), json.dumps(incoming_row, ensure_ascii=True, default=str), json.dumps(existing_row, ensure_ascii=True, default=str), float(similarity), time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))",
+        "",
+        "",
+        "def write_values_to_sqlite(table_name, columns, semantic_duplicate_removal=False, duplicate_threshold=0.88, current_row=None):",
         "    if not str(table_name or '').strip() or chr(0) in str(table_name): raise ValueError('Writer requires a valid table name')",
         "    normalized = []",
         "    for column in columns or []:",
@@ -1534,6 +1954,30 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "            for name, column_type, _ in normalized:",
         "                if name not in existing: connection.execute(f'ALTER TABLE {quoted_table} ADD COLUMN {chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34)} {column_type}')",
         "        writable = [(name, column) for name, _, column in normalized if column.get('write', True)]",
+        "        row_updates = [(name, column) for name, column in writable if str(column.get('value') or '') != '']",
+        "        has_current_row = isinstance(current_row, dict) and current_row.get('__sui_table') == str(table_name) and current_row.get('__sui_rowid') not in (None, '')",
+        "        if has_current_row and row_updates:",
+        "            assignments = ', '.join(chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34) + ' = ?' for name, _ in row_updates)",
+        "            values = tuple(str(column.get('value') or '') for _, column in row_updates)",
+        "            connection.execute(f'UPDATE {quoted_table} SET {assignments} WHERE rowid = ?', values + (int(current_row.get('__sui_rowid')),))",
+        "            connection.commit()",
+        "            return {'updated': True}",
+        "        if has_current_row:",
+        "            connection.commit()",
+        "            return {'updated': False, 'skipped': True}",
+        "        if semantic_duplicate_removal and writable:",
+        "            incoming_row = {name: column.get('value') for name, column in writable}",
+        "            connection.row_factory = sqlite3.Row",
+        "            candidates = connection.execute(f'SELECT * FROM {quoted_table}').fetchall()",
+        "            best_match, best_score = None, 0.0",
+        "            for candidate in candidates:",
+        "                candidate_row = {name: candidate[name] for name, _ in writable}",
+        "                score = semantic_row_similarity(incoming_row, candidate_row)",
+        "                if score > best_score: best_match, best_score = dict(candidate), score",
+        "            if best_match is not None and best_score >= float(duplicate_threshold):",
+        "                record_semantic_duplicate(connection, table_name, incoming_row, best_match, best_score)",
+        "                connection.commit()",
+        "                return {'duplicate': True, 'similarity': best_score}",
         "        if writable:",
         "            names = ', '.join(chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34) for name, _ in writable)",
         "            placeholders = ', '.join('?' for _ in writable)",
@@ -1565,8 +2009,7 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "    connection = sqlite3.connect(WRITER_DB_PATH)",
         "    connection.row_factory = sqlite3.Row",
         "    try:",
-        "        if column: return [row[0] for row in connection.execute(f'SELECT {quote(column)} FROM {quote(table)}').fetchall()]",
-        "        return [dict(row) for row in connection.execute(f'SELECT * FROM {quote(table)}').fetchall()]",
+        "        return [dict(row) for row in connection.execute(f'SELECT rowid AS __sui_rowid, * FROM {quote(table)}').fetchall()]",
         "    finally:",
         "        connection.close()",
         "",
@@ -1593,15 +2036,37 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "    return page.locator(value)",
         "",
         "",
+        "def is_frame_transition_error(exc):",
+        "    message = str(exc).lower()",
+        "    return any(marker in message for marker in (",
+        "        'frame ownership changed', 'execution context was destroyed',",
+        "        'cannot find context with specified id', 'context was destroyed',",
+        "    ))",
+        "",
+        "",
         "async def wait_for_locator(page, selector, action, timeout_ms=30000):",
         "    value = str(selector or '').strip()",
         "    if not value: raise ValueError(action + ' requires a selector')",
-        "    locator = async_locator_for(page, value).first",
-        "    try:",
-        "        await locator.wait_for(state='attached' if str(action).lower() == 'scrape' else 'visible', timeout=timeout_ms)",
-        "    except Exception as exc:",
-        "        raise RuntimeError(action + ' target not found for selector ' + repr(value)) from exc",
-        "    return locator",
+        "    deadline = asyncio.get_running_loop().time() + max(float(timeout_ms), 1) / 1000.0",
+        "    while True:",
+        "        try:",
+        "            locator = async_locator_for(page, value).first",
+        "            remaining_ms = max(100, int((deadline - asyncio.get_running_loop().time()) * 1000))",
+        "            await locator.wait_for(state='attached' if str(action).lower() == 'scrape' else 'visible', timeout=remaining_ms)",
+        "            return locator",
+        "        except Exception as exc:",
+        "            if not is_frame_transition_error(exc) or asyncio.get_running_loop().time() >= deadline:",
+        "                raise RuntimeError(action + ' target not found for selector ' + repr(value)) from exc",
+        "            await asyncio.sleep(0.10)",
+        "",
+        "",
+        "async def page_body_text(page, timeout_seconds=30):",
+        "    deadline = asyncio.get_running_loop().time() + max(float(timeout_seconds), 0.1)",
+        "    while True:",
+        "        try: return await page.locator('body').inner_text()",
+        "        except Exception as exc:",
+        "            if not is_frame_transition_error(exc) or asyncio.get_running_loop().time() >= deadline: raise",
+        "            await asyncio.sleep(0.10)",
         "",
         "",
         "def page_url(page):",
@@ -1679,8 +2144,41 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "",
         f"selected_step = json.loads({step_literal})",
         f"variables = json.loads({variables_literal})",
+        f"ORCHESTRATOR_PROJECT_ID = {project_id_literal}",
+        f"CALL_STACK = [{recipe_id_literal}]",
         "PAGE_OPENERS = {}",
         "PAGE_SOURCES = {}",
+        "",
+        "",
+        "def load_called_recipe(settings):",
+        "    target_id = str(settings.get('recipe_id') or '').strip()",
+        "    target_name = str(settings.get('recipe_name') or '').strip()",
+        "    connection = sqlite3.connect(WRITER_DB_PATH)",
+        "    try:",
+        "        if target_id:",
+        "            row = connection.execute(\"SELECT rv.definition_json FROM recipe_versions rv JOIN recipes r ON r.id = rv.recipe_id WHERE r.project_id = ? AND r.id = ? ORDER BY rv.version DESC LIMIT 1\", (ORCHESTRATOR_PROJECT_ID, target_id)).fetchone()",
+        "        else:",
+        "            row = connection.execute(\"SELECT rv.definition_json FROM recipe_versions rv JOIN recipes r ON r.id = rv.recipe_id WHERE r.project_id = ? AND r.name = ? ORDER BY rv.version DESC LIMIT 1\", (ORCHESTRATOR_PROJECT_ID, target_name)).fetchone()",
+        "    finally:",
+        "        connection.close()",
+        "    if not row: raise ValueError('Target recipe was not found in this project')",
+        "    return json.loads(row[0])",
+        "",
+        "",
+        "async def run_called_recipe(page, settings, capture_lock):",
+        "    target = load_called_recipe(settings)",
+        "    target_id = str(target.get('recipe_id') or '')",
+        "    if target_id in CALL_STACK: raise ValueError('Recursive recipe calls are not allowed')",
+        "    previous_variables = dict(variables)",
+        "    variables.clear()",
+        "    variables.update({item.get('name'): item.get('value', '') for item in target.get('variables', []) if item.get('name')})",
+        "    CALL_STACK.append(target_id)",
+        "    try:",
+        "        return await execute_steps(page, target.get('steps') or [], capture_lock)",
+        "    finally:",
+        "        CALL_STACK.pop()",
+        "        variables.clear()",
+        "        variables.update(previous_variables)",
         "",
         "",
         "async def execute_step(page, step, capture_lock):",
@@ -1733,12 +2231,20 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "        variables[settings.get('variable')] = resolve(settings.get('value'), variables); await human_pause(0.25)",
         "    elif step_type == 'scrape':",
         "        variables[settings.get('variable')] = await (await wait_for_locator(page, resolve(settings.get('selector'), variables), 'Scrape')).inner_text(); await human_pause(0.30)",
+        "    elif step_type == 'pattern_matcher':",
+        "        source = await page_body_text(page); combined_pattern = '|'.join('(?:' + str(pattern) + ')' for pattern in (settings.get('patterns') or []))",
+        "        matches = [candidate.group(0) for candidate in re.finditer(combined_pattern, source, re.IGNORECASE)] if combined_pattern else []",
+        "        variables[settings.get('variable')] = ' | '.join(matches) if matches else 'NO CONTACTS FOUND'; await human_pause(0.30)",
+        "    elif step_type == 'smartie':",
+        "        smartie_system = resolve(settings.get('system_prompt'), variables); smartie_user = resolve(settings.get('user_prompt'), variables); variables[settings.get('output_variable')] = await asyncio.to_thread(run_smartie, settings.get('model', 'gemini-2.5-flash'), smartie_system, smartie_user, settings.get('output_type', 'text'), settings.get('schema') or []); await human_pause(0.30)",
         "    elif step_type == 'message_box':",
         "        await show_message_box(page, resolve(settings.get('message'), variables))",
         f"        if {json.dumps(mode)} == 'headless': await page.locator('#sui-message-box-ok').click()",
         "        else: await page.wait_for_function(\"() => !document.getElementById('sui-message-box')\")",
         "    elif step_type == 'writer':",
-        "        writer_columns = [dict(column, value=resolve(column.get('value'), variables)) for column in (settings.get('columns') or [{'name': 'value', 'type': 'TEXT', 'value': settings.get('value', ''), 'write': True}])]; await asyncio.to_thread(write_values_to_sqlite, settings.get('table_name'), writer_columns); await human_pause(0.25)",
+        "        writer_columns = [dict(column, value=resolve(column.get('value'), variables)) for column in (settings.get('columns') or [{'name': 'value', 'type': 'TEXT', 'value': settings.get('value', ''), 'write': True}])]; current_row = variables.get(settings.get('current_row')) if settings.get('current_row') else None; await asyncio.to_thread(write_values_to_sqlite, settings.get('table_name'), writer_columns, settings.get('semantic_duplicate_removal', False), settings.get('duplicate_threshold', 0.88), current_row); await human_pause(0.25)",
+        "    elif step_type in {'call_recipe', 'invoke_recipe'}:",
+        "        page = await run_called_recipe(page, settings, capture_lock); await human_pause(0.25)",
         "    elif step_type == 'check_element_exists':",
         "        selector = resolve(settings.get('selector'), variables); locator = async_locator_for(page, selector)",
         "        try:",
@@ -1749,7 +2255,7 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "    elif step_type == 'check_text_exists':",
         "        expected = resolve(settings.get('text'), variables); timeout = float(settings.get('timeout_seconds', 5)); deadline = asyncio.get_running_loop().time() + timeout; exists = False",
         "        while asyncio.get_running_loop().time() < deadline:",
-        "            body = await page.locator('body').inner_text(); exists = expected.lower() in body.lower() if settings.get('case_insensitive', True) else expected in body",
+        "            body = await page_body_text(page, max(0.1, deadline - asyncio.get_running_loop().time())); exists = expected.lower() in body.lower() if settings.get('case_insensitive', True) else expected in body",
         "            if exists: break",
         "            await asyncio.sleep(0.2)",
         "        page = await execute_steps(page, (step.get('branches') or {}).get('exists' if exists else 'not_exists', []), capture_lock)",
@@ -1763,7 +2269,8 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "            if loop_count < 0: raise ValueError('For loop range must not be negative')",
         "            loop_iterable = ((loop_index, loop_index) for loop_index in range(loop_start, loop_start + loop_count))",
         "        for loop_index, loop_value in loop_iterable:",
-        "            variables[iterator] = loop_value",
+        "            variables[iterator] = loop_value.get(column_name) if settings.get('source') == 'table' and table_mode == 'column' else loop_value",
+        "            variables['currentRow'] = dict(loop_value, __sui_table=table_name) if settings.get('source') == 'table' and isinstance(loop_value, dict) else variables.get('currentRow')",
         "            print(f\"SUI_LOG:For loop iteration {loop_index} started\", flush=True)",
         "            try:",
         "                page = await execute_steps(page, (step.get('branches') or {}).get('body', []), capture_lock)",
@@ -1932,7 +2439,7 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "        current_task = asyncio.create_task(execute_command(session, command, capture_lock))",
         "",
         "",
-    ]
+    ])
     _generated_window_support(lines)
     lines.extend(
         [
@@ -2735,15 +3242,18 @@ def start_step_run(payload: dict[str, Any]) -> tuple[str, int, str]:
     recipe_id = str(payload.get("recipe_id") or "draft-recipe")
     studio_session_id = str(payload.get("studio_session_id") or "default-studio")
     mode = "headless" if payload.get("mode") == "headless" else "headful"
+    recipe_type = validate_recipe_type(payload.get("recipe_type", "standard"))
     scope = (project_id, recipe_id, studio_session_id, mode)
     definition = normalize_definition(
-        {"steps": [step], "variables": payload.get("variables") or [], "mode": mode},
+        {"steps": [step], "variables": payload.get("variables") or [], "mode": mode, "recipe_type": recipe_type},
         project_id, recipe_id, "step-run", 1, require_first_navigation=False,
     )
+
+
     normalized_step = definition["steps"][0]
     if normalized_step["type"] == "navigate_to_website":
         command = {"type": "navigate", "url": normalized_step["settings"]["url"]}
-    elif normalized_step["type"] in {"navigate", "click", "fill", "check_element_exists", "check_text_exists", "if", "for", "use_js", "keypress", "message_box", "scrape", "writer"}:
+    elif normalized_step["type"] in {"navigate", "click", "fill", "check_element_exists", "check_text_exists", "if", "for", "use_js", "keypress", "message_box", "scrape", "pattern_matcher", "smartie", "writer", "call_recipe", "invoke_recipe"}:
         command = {"type": "run_step", "step": normalized_step}
     elif normalized_step["type"] == "delay":
         command = {
@@ -3012,7 +3522,7 @@ class SuiHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -3241,6 +3751,13 @@ class SuiHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path
         try:
+            if path == "/api/data/table":
+                body = parse_json_body(self)
+                return self.send_payload({"deleted": delete_data_table(body.get("table", ""))})
+            if path == "/api/data/table/row":
+                body = parse_json_body(self)
+                result = data_table_row(body.get("table", ""), "delete", row_id=body.get("row_id"))
+                return self.send_payload(result)
             if path.startswith("/api/recipes/"):
                 recipe_id = path.split("/")[3]
                 with db_connection() as connection:
@@ -3252,7 +3769,7 @@ class SuiHandler(BaseHTTPRequestHandler):
             return self.send_error_payload("Route not found", HTTPStatus.NOT_FOUND)
         except sqlite3.IntegrityError:
             self.send_error_payload("Recipe cannot be deleted because it has job history")
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, ValueError, KeyError) as exc:
             self.send_error_payload(str(exc), HTTPStatus.BAD_REQUEST)
 
     def serve_static(self, path: str) -> None:
