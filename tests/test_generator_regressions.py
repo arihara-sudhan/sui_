@@ -1,0 +1,396 @@
+import ast
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import main
+
+
+class GeneratorRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.definition = {
+            "mode": "headless",
+            "steps": [
+                {
+                    "id": "step_navigation",
+                    "type": "navigate_to_website",
+                    "settings": {"url": "https://example.com"},
+                }
+            ],
+        }
+
+    def test_picker_coordinates_are_json_objects_and_js_destructuring_is_preserved(self):
+        source = main.generate_step_python(self.definition)
+
+        self.assertGreaterEqual(source.count(', {"x": x, "y": y})'), 3)
+        self.assertNotIn(", {x, y})", source)
+        self.assertIn("({x, y}) =>", source)
+
+    def test_picker_hover_overlay_is_generated_in_the_browser(self):
+        source = main.generate_step_python(self.definition)
+
+        self.assertIn("async def highlight_picker_target", source)
+        self.assertIn("#FF5B35", source)
+        self.assertIn("pointerEvents: 'none'", source)
+        self.assertIn("inspect_move", source)
+
+    def test_picker_matches_rcs_selector_families_and_role_execution(self):
+        source = main.generate_step_python(self.definition)
+
+        for marker in (
+            "data-testid",
+            "data-test",
+            "data-qa",
+            "placeholder",
+            "role=",
+            ":has-text(",
+            "contenteditable",
+            "nth-of-type",
+            "async def inspect_picker_at",
+            "def locator_for",
+        ):
+            self.assertIn(marker, source)
+        self.assertIn("get_by_role", source)
+
+    def test_picker_input_returns_event_cursor_and_stream_honors_it(self):
+        source = Path(main.__file__).read_text(encoding="utf-8")
+
+        self.assertIn('"event_index": event_index', source)
+        self.assertIn("index = max(0, int(start_index))", source)
+
+    def test_picker_action_frame_is_emitted_before_completion(self):
+        source = main.generate_step_python(self.definition)
+        command_loop = source[source.index("async def execute_command"):]
+
+        self.assertLess(
+            command_loop.index("await emit_frame(page, capture_lock)"),
+            command_loop.index("if action_result is not None"),
+        )
+
+    def test_message_box_is_a_normalized_browser_action(self):
+        source = main.generate_step_python(self.definition)
+
+        self.assertIn("action_result = {'status': 'completed', 'action': 'message_box', 'command_id': command.get('command_id')}", source)
+        self.assertIn("await show_message_box(page, str(command.get('message') or ''))", source)
+
+    def test_command_busy_clears_only_for_matching_completion(self):
+        run_id = "regression-command-run"
+        main.STEP_RUNS[run_id] = {
+            "process": None,
+            "command_busy": True,
+            "busy_command_id": "command-expected",
+        }
+        try:
+            self.assertFalse(main.clear_command_busy_if_matching(run_id, "command-other"))
+            self.assertTrue(main.STEP_RUNS[run_id]["command_busy"])
+            self.assertTrue(main.clear_command_busy_if_matching(run_id, "command-expected"))
+            self.assertFalse(main.STEP_RUNS[run_id]["command_busy"])
+        finally:
+            main.STEP_RUNS.pop(run_id, None)
+
+    def test_replacing_busy_command_sends_cancel_before_new_command(self):
+        class FakeStdin:
+            def __init__(self):
+                self.lines = []
+
+            def write(self, value):
+                self.lines.append(value)
+
+            def flush(self):
+                return None
+
+        class FakeProcess:
+            def __init__(self):
+                self.stdin = FakeStdin()
+
+            def poll(self):
+                return None
+
+        run_id = "regression-replace-run"
+        process = FakeProcess()
+        main.STEP_RUNS[run_id] = {
+            "process": process,
+            "command_busy": True,
+            "busy_command_id": "command-old",
+        }
+        try:
+            new_id = main.send_browser_command(run_id, {"type": "delay", "seconds": 1}, reserve_step=True)
+            self.assertEqual(main.STEP_RUNS[run_id]["busy_command_id"], new_id)
+            self.assertEqual(json.loads(process.stdin.lines[0]), {"type": "cancel_command", "command_id": "command-old"})
+            self.assertEqual(json.loads(process.stdin.lines[1]), {"type": "delay", "seconds": 1, "command_id": new_id})
+        finally:
+            main.STEP_RUNS.pop(run_id, None)
+
+    def test_new_executable_command_cancels_the_previous_command(self):
+        source = Path(main.__file__).read_text(encoding="utf-8")
+        generated = main.generate_step_python(self.definition)
+
+        self.assertIn('"type": "cancel_command"', source)
+        self.assertIn("previous_command_id", source)
+        self.assertIn("Superseded by a newer command", generated)
+        self.assertIn("command.get('type') in executable_types", generated)
+        self.assertNotIn('A step is already running in this browser session', source)
+
+    def test_use_js_allows_empty_bindings_and_normalizes_braced_references(self):
+        definition = {
+            "mode": "headless",
+            "variables": [
+                {"id": "variable_name", "name": "name", "value": "Ada"},
+                {"id": "variable_result", "name": "result", "value": ""},
+            ],
+            "steps": [{
+                "id": "step_js",
+                "type": "use_js",
+                "settings": {"code": "return args[0] || 'ok';", "inputs": ["{name}"], "output": "{result}"},
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(normalized["steps"][0]["settings"]["inputs"], ["name"])
+        self.assertEqual(normalized["steps"][0]["settings"]["output"], "result")
+
+        empty = main.normalize_definition({"mode": "headless", "steps": [{
+            "id": "step_js",
+            "type": "use_js",
+            "settings": {"code": "return 'ok';", "inputs": [], "output": ""},
+        }]}, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(empty["steps"][0]["settings"]["inputs"], [])
+        self.assertEqual(empty["steps"][0]["settings"]["output"], "")
+
+        generated = main.generate_step_python(empty)
+        self.assertIn("function suiJSRunner(args)", generated)
+        self.assertIn("'body': settings.get('code', '')", generated)
+
+    def test_check_text_exists_waits_until_timeout_before_not_exists_branch(self):
+        definition = {
+            "mode": "headless",
+            "steps": [{
+                "id": "step_check",
+                "type": "check_text_exists",
+                "settings": {"text": "Post your Need", "timeout_seconds": 2, "case_insensitive": True},
+                "branches": {"exists": [], "not_exists": []},
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(normalized["steps"][0]["settings"]["timeout_seconds"], 2.0)
+        sync_source = main.generate_python(normalized)
+        async_source = main.generate_step_python(normalized)
+        for source in (sync_source, async_source):
+            self.assertIn("deadline", source)
+            self.assertIn("if exists: break", source)
+            self.assertIn("not_exists", source)
+
+    def test_keypress_activity_normalizes_and_generates_browser_key_action(self):
+        definition = {
+            "mode": "headless",
+            "steps": [{"id": "step_key", "type": "keypress", "settings": {"key": "Esc"}}],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(normalized["steps"][0]["settings"]["key"], "Escape")
+        source = main.generate_step_python(normalized)
+        self.assertIn("step_type == 'keypress'", source)
+        self.assertIn("page.keyboard.press", source)
+
+        with self.assertRaises(ValueError):
+            main.normalize_definition({
+                "mode": "headless",
+                "steps": [{"id": "step_key", "type": "keypress", "settings": {"key": "NotAKey"}}],
+            }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+
+    def test_delay_can_wait_for_load_or_use_seconds(self):
+        for until_load_completes in (False, True):
+            normalized = main.normalize_definition({
+                "mode": "headless",
+                "steps": [{
+                    "id": "step_delay",
+                    "type": "delay",
+                    "settings": {"seconds": 2, "until_load_completes": until_load_completes},
+                }],
+            }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+            settings = normalized["steps"][0]["settings"]
+            self.assertEqual(settings["seconds"], 2.0)
+            self.assertEqual(settings["until_load_completes"], until_load_completes)
+
+        source = main.generate_python(normalized)
+        step_source = main.generate_step_python(normalized)
+        for generated in (source, step_source):
+            self.assertIn("until_load_completes", generated)
+            self.assertIn("wait_for_load_state", generated)
+            self.assertIn("settings.get('seconds', 1)", generated)
+
+    def test_disabled_steps_are_preserved_and_skipped_by_both_runtimes(self):
+        normalized = main.normalize_definition({
+            "mode": "headless",
+            "steps": [{
+                "id": "step_disabled",
+                "type": "message_box",
+                "disabled": True,
+                "settings": {"message": "do not run"},
+            }],
+        }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertTrue(normalized["steps"][0]["disabled"])
+        for generated in (main.generate_python(normalized), main.generate_step_python(normalized)):
+            self.assertIn("if step.get('disabled')", generated)
+            self.assertIn("SUI_LOG:Step skipped", generated)
+
+    def test_navigate_activity_supports_history_and_refresh_actions(self):
+        for action in ("back", "forward", "refresh"):
+            normalized = main.normalize_definition({
+                "mode": "headless",
+                "steps": [{"id": "step_navigate", "type": "navigate", "settings": {"action": action}}],
+            }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+            self.assertEqual(normalized["steps"][0]["settings"]["action"], action)
+            source = main.generate_step_python(normalized)
+            self.assertIn("step_type == 'navigate'", source)
+            self.assertIn("wait_until='commit'", source)
+            self.assertIn("page.go_back", source)
+            self.assertIn("page.go_forward", source)
+            self.assertIn("page.reload", source)
+
+        with self.assertRaises(ValueError):
+            main.normalize_definition({
+                "mode": "headless",
+                "steps": [{"id": "step_navigate", "type": "navigate", "settings": {"action": "home"}}],
+            }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+
+    def test_for_loop_normalizes_range_and_generates_nested_body_execution(self):
+        definition = {
+            "mode": "headless",
+            "variables": [{"id": "variable_count", "name": "count", "value": "3"}],
+            "steps": [{
+                "id": "step_for",
+                "type": "for",
+                "settings": {"iterator": "{i}=1", "range_value": "count+1"},
+                "branches": {"body": [{
+                    "id": "step_message",
+                    "type": "message_box",
+                    "settings": {"message": "{i}"},
+                }, {
+                    "id": "step_click",
+                    "type": "click",
+                    "settings": {"selector": "#position-spotlight-{i}"},
+                }]},
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(normalized["steps"][0]["settings"], {"iterator": "i", "start_value": 1, "range_value": "count+1"})
+        self.assertEqual(normalized["steps"][0]["branches"]["body"][0]["type"], "message_box")
+        self.assertEqual(normalized["steps"][0]["branches"]["body"][1]["settings"]["selector"], "#position-spotlight-{i}")
+        for source in (main.generate_python(normalized), main.generate_step_python(normalized)):
+            self.assertIn("step_type == 'for'", source)
+            self.assertIn("range(loop_start, loop_start + loop_count)", source)
+            self.assertIn("resolve_loop_range", source)
+            self.assertIn("get('body', [])", source)
+
+        with self.assertRaises(ValueError):
+            main.normalize_definition({
+                "mode": "headless",
+                "steps": [{"id": "step_for", "type": "for", "settings": {"iterator": "i", "range_value": "{missing}"}}],
+            }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+
+    def test_full_and_single_step_paths_wait_for_the_same_resolved_loop_targets(self):
+        definition = {
+            "mode": "headless",
+            "variables": [
+                {"id": "variable_count", "name": "count", "value": "2"},
+                {"id": "variable_value", "name": "value", "value": ""},
+            ],
+            "steps": [{
+                "id": "step_for",
+                "type": "for",
+                "settings": {"iterator": "i", "start_value": 1, "range_value": "count"},
+                "branches": {"body": [
+                    {"id": "step_scrape", "type": "scrape", "settings": {"selector": "#item-{i}", "variable": "value"}},
+                    {"id": "step_click", "type": "click", "settings": {"selector": "#next-{i}"}},
+                ]},
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        full_source = main.generate_python(normalized)
+        step_source = main.generate_step_python(normalized)
+        for source in (full_source, step_source):
+            self.assertIn("wait_for_locator", source)
+            self.assertIn("resolve(settings.get('selector'), variables)", source)
+            self.assertIn("action + ' target not found for selector '", source)
+        self.assertIn("for loop_index in range(loop_start, loop_start + loop_count)", full_source)
+        self.assertIn("execute_steps(page, (step.get('branches') or {}).get('body', []))", full_source)
+
+    def test_job_stream_initializes_and_honors_event_cursor(self):
+        source = Path(main.__file__).read_text(encoding="utf-8")
+
+        self.assertIn("def stream_job_events(self, job_id: str, start_index: int = 0)", source)
+        self.assertIn("index = max(0, int(start_index))", source)
+        self.assertIn("return self.stream_job_events(path.split(\"/\")[3], int(query.get(\"after\", [0])[0] or 0))", source)
+        self.assertIn("id: {index}\\ndata:", source)
+
+    def test_startup_cleanup_is_scoped_to_python_port_owner(self):
+        source = Path(main.__file__).read_text(encoding="utf-8")
+
+        self.assertIn("def stop_existing_python_backend", source)
+        self.assertIn('if \"python\" not in Path(image_path).name.lower()', source)
+        self.assertIn("Stop-Process -Id", source)
+
+    def test_picker_wire_json_is_ascii_but_round_trips_unicode(self):
+        source = main.generate_step_python(self.definition)
+        tree = ast.parse(source)
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "inspect_wire_text"
+        )
+        function_module = ast.Module(
+            body=[ast.Import(names=[ast.alias(name="json")]), function],
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(function_module)
+        namespace = {
+            "json_safe": main._json_safe_value,
+        }
+        exec(compile(function_module, "generated-picker-test.py", "exec"), namespace)
+
+        original = {"metadata": {"text": "🍌 தமிழ்"}, "selectorCandidates": {"#search"}}
+        wire = namespace["inspect_wire_text"](json.dumps(main._json_safe_value(original), ensure_ascii=False))
+
+        self.assertTrue(wire.isascii())
+        self.assertEqual(json.loads(wire)["metadata"]["text"], "🍌 தமிழ்")
+        self.assertEqual(json.loads(wire)["selectorCandidates"], ["#search"])
+
+    def test_generated_script_execution_preserves_unicode_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "unicode-output.py"
+            script.write_text("print('🍌 தமிழ்')\n", encoding="utf-8")
+            code, stdout, stderr = main.execute_generated(script)
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stdout, ["🍌 தமிழ்"])
+
+    def test_inspect_event_reaches_frontend_payload_unchanged(self):
+        source = main.generate_step_python(self.definition)
+        tree = ast.parse(source)
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "inspect_wire_text"
+        )
+        function_module = ast.Module(
+            body=[ast.Import(names=[ast.alias(name="json")]), function],
+            type_ignores=[],
+        )
+        ast.fix_missing_locations(function_module)
+        namespace = {"json_safe": main._json_safe_value}
+        exec(compile(function_module, "generated-picker-event-test.py", "exec"), namespace)
+
+        main.STEP_RUNS.clear()
+        main.STEP_RUNS["picker-test"] = {"events": []}
+        element = {
+            "selector": "button[aria-label='🍌']",
+            "selectorCandidates": [{"kind": "ARIA label", "selector": "[aria-label='🍌']", "unique": True}],
+            "metadata": {"text": "🍌 தமிழ்", "ariaLabel": "🍌"},
+        }
+        wire = namespace["inspect_wire_text"](json.dumps(element, ensure_ascii=False))
+        main.emit_step_event("picker-test", {"type": "inspect", "element": json.loads(wire)})
+
+        delivered = main.STEP_RUNS["picker-test"]["events"][0]["element"]
+        self.assertEqual(delivered, element)
+
+
+if __name__ == "__main__":
+    unittest.main()
