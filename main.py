@@ -42,7 +42,10 @@ SUPPORTED_STEP_TYPES = {
     "if",
     "for",
     "use_js",
+    "writer",
 }
+WRITER_COLUMN_TYPES = {"TEXT", "INTEGER", "REAL", "BLOB", "BOOLEAN", "DATE", "DATETIME"}
+INTERNAL_SQLITE_TABLES = {"projects", "recipes", "recipe_versions", "jobs", "job_logs"}
 KEYPRESS_KEYS = {
     "Enter", "Escape", "Tab", "Backspace", "Delete", "Space",
     "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End",
@@ -162,6 +165,28 @@ def validate_delay(value: Any) -> float:
     return round(seconds, 3)
 
 
+def validate_wait_timeout(value: Any) -> float:
+    try:
+        timeout = float(value if value is not None else 15)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Post-action wait timeout must be a number of seconds") from exc
+    if timeout < 0.1 or timeout > 120:
+        raise ValueError("Post-action wait timeout must be between 0.1 and 120 seconds")
+    return round(timeout, 3)
+
+
+def normalize_post_action_wait(settings: dict[str, Any]) -> dict[str, Any]:
+    expected_url = str(settings.get("expected_url") or "").strip()
+    destination_selector = str(settings.get("destination_selector") or "").strip()
+    if destination_selector:
+        destination_selector = validate_selector(destination_selector)
+    return {
+        "expected_url": expected_url,
+        "destination_selector": destination_selector,
+        "wait_timeout_seconds": validate_wait_timeout(settings.get("wait_timeout_seconds", 15)),
+    }
+
+
 def validate_until_load_completes(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -202,6 +227,268 @@ def validate_variable_name(value: Any) -> str:
     if not name or not name.replace("_", "a").isalnum() or name[0].isdigit():
         raise ValueError("Variable names must start with a letter or underscore and contain only letters, numbers, and underscores")
     return name
+
+
+def validate_table_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if not name or "\x00" in name or len(name) > 255:
+        raise ValueError("Writer requires a non-empty table name")
+    return name
+
+
+def validate_writer_column_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if not name or "\x00" in name or len(name) > 255:
+        raise ValueError("Writer column names must be non-empty")
+    return name
+
+
+def validate_writer_column_type(value: Any) -> str:
+    column_type = str(value or "TEXT").strip().upper()
+    if column_type not in WRITER_COLUMN_TYPES:
+        raise ValueError(f"Unsupported Writer column type: {column_type}")
+    return column_type
+
+
+def normalize_existing_sqlite_type(value: Any) -> str:
+    raw_type = str(value or "TEXT").strip().upper()
+    if raw_type in WRITER_COLUMN_TYPES:
+        return raw_type
+    if "INT" in raw_type:
+        return "INTEGER"
+    if any(token in raw_type for token in ("CHAR", "CLOB", "TEXT")):
+        return "TEXT"
+    if "BLOB" in raw_type or not raw_type:
+        return "BLOB" if "BLOB" in raw_type else "TEXT"
+    if any(token in raw_type for token in ("REAL", "FLOA", "DOUB")):
+        return "REAL"
+    return "REAL"
+
+
+def normalize_writer_columns(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_columns = settings.get("columns")
+    if not isinstance(raw_columns, list) or not raw_columns:
+        raw_columns = [{"name": "value", "type": "TEXT", "value": settings.get("value", "")}]
+    columns: list[dict[str, Any]] = []
+    names: set[str] = set()
+    for raw_column in raw_columns:
+        if not isinstance(raw_column, dict):
+            raise ValueError("Writer columns must be objects")
+        name = validate_writer_column_name(raw_column.get("name"))
+        name_key = name.casefold()
+        if name_key in names:
+            raise ValueError(f"Writer column {name} is duplicated")
+        names.add(name_key)
+        columns.append({
+            "name": name,
+            "type": validate_writer_column_type(raw_column.get("type", "TEXT")),
+            "value": str(raw_column.get("value") or ""),
+            "write": bool(raw_column.get("write", True)),
+        })
+    return columns
+
+
+def quote_sqlite_identifier(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def writer_tables() -> list[str]:
+    connection = db_connection()
+    try:
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+    finally:
+        connection.close()
+    return [str(row["name"]) for row in rows if str(row["name"]) not in INTERNAL_SQLITE_TABLES]
+
+
+def viewer_tables() -> list[str]:
+    connection = db_connection()
+    try:
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+    finally:
+        connection.close()
+    return [str(row["name"]) for row in rows if str(row["name"]) not in INTERNAL_SQLITE_TABLES]
+
+
+def viewer_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {"encoding": "base64", "value": base64.b64encode(value).decode("ascii")}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def viewer_table_data(table_name: str, limit: Any = 200) -> dict[str, Any]:
+    name = validate_table_name(table_name)
+    try:
+        row_limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Viewer row limit must be an integer") from exc
+    connection = db_connection()
+    try:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        if not exists:
+            raise ValueError("Viewer table not found")
+        schema_rows = connection.execute(f"PRAGMA table_info({quote_sqlite_identifier(name)})").fetchall()
+        rows = connection.execute(
+            f"SELECT rowid AS __sui_rowid, * FROM {quote_sqlite_identifier(name)} LIMIT ?", (row_limit,)
+        ).fetchall()
+    finally:
+        connection.close()
+    columns = [
+        {"name": str(row["name"]), "type": normalize_existing_sqlite_type(row["type"])}
+        for row in schema_rows
+    ]
+    return {
+        "table": name,
+        "columns": columns,
+        "rows": [{str(key): viewer_value(row[key]) for key in row.keys()} for row in rows],
+        "limit": row_limit,
+    }
+
+
+def data_table_row(table_name: str, operation: str, raw_values: Any = None, row_id: Any = None, column_name: Any = None, value: Any = None) -> dict[str, Any]:
+    name = validate_table_name(table_name)
+    if name in INTERNAL_SQLITE_TABLES or name.startswith("sqlite_"):
+        raise ValueError("That table is reserved by Sui")
+    connection = db_connection()
+    try:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        if not exists:
+            raise ValueError("Data table not found")
+        schema_rows = connection.execute(f"PRAGMA table_info({quote_sqlite_identifier(name)})").fetchall()
+        schema_names = {str(row["name"]): str(row["name"]) for row in schema_rows}
+        quoted_table = quote_sqlite_identifier(name)
+        if operation == "insert":
+            if not isinstance(raw_values, dict):
+                raise ValueError("A row must be an object")
+            values = [(schema_names[key], raw_values[key]) for key in raw_values if key in schema_names]
+            if not values:
+                raise ValueError("Add a value for at least one column")
+            quoted_columns = ", ".join(quote_sqlite_identifier(key) for key, _ in values)
+            placeholders = ", ".join("?" for _ in values)
+            connection.execute(
+                f"INSERT INTO {quoted_table} ({quoted_columns}) VALUES ({placeholders})",
+                tuple(item for _, item in values),
+            )
+        elif operation == "update":
+            try:
+                numeric_row_id = int(row_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("A valid row is required") from exc
+            column = str(column_name or "")
+            if column not in schema_names:
+                raise ValueError("Column not found")
+            result = connection.execute(
+                f"UPDATE {quoted_table} SET {quote_sqlite_identifier(column)} = ? WHERE rowid = ?",
+                (value, numeric_row_id),
+            )
+            if result.rowcount != 1:
+                raise ValueError("Row not found")
+        else:
+            raise ValueError("Unsupported data operation")
+        connection.commit()
+    finally:
+        connection.close()
+    return viewer_table_data(name, 500)
+
+
+def craft_table(table_name: str, raw_columns: Any) -> dict[str, Any]:
+    name = validate_table_name(table_name)
+    if name in INTERNAL_SQLITE_TABLES or name.startswith("sqlite_"):
+        raise ValueError("That table is reserved by Sui")
+    if not isinstance(raw_columns, list) or not raw_columns:
+        raise ValueError("Craft requires at least one column")
+    columns: list[tuple[str, str, str | None]] = []
+    names: set[str] = set()
+    for raw_column in raw_columns:
+        if not isinstance(raw_column, dict):
+            raise ValueError("Craft columns must be objects")
+        column_name = validate_writer_column_name(raw_column.get("name"))
+        if column_name.casefold() in names:
+            raise ValueError(f"Column {column_name} is duplicated")
+        names.add(column_name.casefold())
+        original_name = str(raw_column.get("original_name") or "").strip() or None
+        if original_name:
+            original_name = validate_writer_column_name(original_name)
+        columns.append((column_name, validate_writer_column_type(raw_column.get("type", "TEXT")), original_name))
+    quoted_table = quote_sqlite_identifier(name)
+    connection = db_connection()
+    try:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        created = not bool(exists)
+        if created:
+            definitions = ", ".join(f"{quote_sqlite_identifier(column_name)} {column_type}" for column_name, column_type, _ in columns)
+            connection.execute(f"CREATE TABLE {quoted_table} ({definitions})")
+        else:
+            schema_rows = connection.execute(f"PRAGMA table_info({quoted_table})").fetchall()
+            existing = {str(row["name"]).casefold(): row for row in schema_rows}
+            for column_name, _, original_name in columns:
+                if original_name and original_name.casefold() in existing and column_name.casefold() not in existing and original_name.casefold() != column_name.casefold():
+                    connection.execute(f"ALTER TABLE {quoted_table} RENAME COLUMN {quote_sqlite_identifier(original_name)} TO {quote_sqlite_identifier(column_name)}")
+                    existing[column_name.casefold()] = existing.pop(original_name.casefold())
+            desired_names = {column_name.casefold() for column_name, _, _ in columns}
+            current_names = set(existing)
+            type_changes = any(
+                column_name.casefold() in existing
+                and normalize_existing_sqlite_type(existing[column_name.casefold()]["type"]) != column_type
+                for column_name, column_type, _ in columns
+            )
+            if type_changes and desired_names == current_names and not any(bool(row["pk"]) for row in existing.values()):
+                temporary_name = f"__sui_craft_{uuid.uuid4().hex}"
+                temporary_table = quote_sqlite_identifier(temporary_name)
+                definitions = ", ".join(f"{quote_sqlite_identifier(column_name)} {column_type}" for column_name, column_type, _ in columns)
+                connection.execute(f"CREATE TABLE {temporary_table} ({definitions})")
+                common = [(column_name, column_type) for column_name, column_type, _ in columns if column_name.casefold() in existing]
+                names = ", ".join(quote_sqlite_identifier(column_name) for column_name, _ in common)
+                casts = ", ".join(f"CAST({quote_sqlite_identifier(column_name)} AS {column_type})" for column_name, column_type in common)
+                if common:
+                    connection.execute(f"INSERT INTO {temporary_table} ({names}) SELECT {casts} FROM {quoted_table}")
+                connection.execute(f"DROP TABLE {quoted_table}")
+                connection.execute(f"ALTER TABLE {temporary_table} RENAME TO {quote_sqlite_identifier(name)}")
+                existing = {column_name.casefold(): {"name": column_name, "type": column_type, "pk": 0} for column_name, column_type, _ in columns}
+            for column_name, column_type, _ in columns:
+                if column_name.casefold() not in existing:
+                    connection.execute(f"ALTER TABLE {quoted_table} ADD COLUMN {quote_sqlite_identifier(column_name)} {column_type}")
+        connection.commit()
+    finally:
+        connection.close()
+    return {"table": name, "columns": writer_table_schema(name), "created": created}
+
+
+def writer_table_schema(table_name: str) -> list[dict[str, Any]]:
+    name = validate_table_name(table_name)
+    connection = db_connection()
+    try:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        if not exists:
+            raise ValueError("Writer table not found")
+        rows = connection.execute(f"PRAGMA table_info({quote_sqlite_identifier(name)})").fetchall()
+    finally:
+        connection.close()
+    return [
+        {
+            "name": str(row["name"]),
+            "type": normalize_existing_sqlite_type(row["type"]),
+            "write": not bool(row["pk"]),
+            "primary_key": bool(row["pk"]),
+            "not_null": bool(row["notnull"]),
+            "default": row["dflt_value"],
+        }
+        for row in rows
+    ]
 
 
 def normalize_variable_reference(value: Any) -> str:
@@ -280,9 +567,14 @@ def normalize_definition(
             "name": variable_name,
             "value": str(raw_variable.get("value") or ""),
         })
-    def normalize_steps(raw_items: Any, branch_label: str = "steps") -> list[dict[str, Any]]:
+    def normalize_steps(
+        raw_items: Any,
+        branch_label: str = "steps",
+        scoped_variable_names: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         if not isinstance(raw_items, list):
             raise ValueError(f"Recipe {branch_label} must be an array")
+        available_variable_names = set(variable_names if scoped_variable_names is None else scoped_variable_names)
         normalized_steps: list[dict[str, Any]] = []
         for index, raw_step in enumerate(raw_items):
             if not isinstance(raw_step, dict):
@@ -296,6 +588,11 @@ def normalize_definition(
                 normalized_settings = {"url": validate_url(settings.get("url"))}
             elif step_type == "navigate":
                 normalized_settings = {"action": validate_navigation_action(settings.get("action", "back"))}
+            elif step_type == "click":
+                normalized_settings = {
+                    "selector": validate_selector(settings.get("selector")),
+                    **normalize_post_action_wait(settings),
+                }
             elif step_type == "fill":
                 normalized_settings = {
                     "selector": validate_selector(settings.get("selector")),
@@ -307,7 +604,10 @@ def normalize_definition(
                     "until_load_completes": validate_until_load_completes(settings.get("until_load_completes", False)),
                 }
             elif step_type == "keypress":
-                normalized_settings = {"key": validate_keypress(settings.get("key", "Enter"))}
+                normalized_settings = {
+                    "key": validate_keypress(settings.get("key", "Enter")),
+                    **normalize_post_action_wait(settings),
+                }
             elif step_type == "assign":
                 variable_name = validate_variable_name(settings.get("variable"))
                 if variable_name not in variable_names:
@@ -347,15 +647,31 @@ def normalize_definition(
                     "right": str(settings.get("right") or ""),
                 }
             elif step_type == "for":
-                iterator, inline_start = normalize_loop_iterator(settings.get("iterator", "i"))
-                start_value = inline_start if inline_start is not None else int(settings.get("start_value", 0) or 0)
-                if start_value < -100000 or start_value > 100000:
-                    raise ValueError("For loop iterator start must be between -100000 and 100000")
-                normalized_settings = {
-                    "iterator": iterator,
-                    "start_value": start_value,
-                    "range_value": validate_loop_range(settings.get("range_value", ""), variable_names),
-                }
+                source = str(settings.get("source") or "range").strip().lower()
+                if source == "table":
+                    table_mode = str(settings.get("table_mode") or "row").strip().lower()
+                    if table_mode not in {"row", "column"}:
+                        raise ValueError("For loop table mode must be row or column")
+                    default_iterator = "row" if table_mode == "row" else str(settings.get("column_name") or "value")
+                    iterator = validate_variable_name(settings.get("iterator") or default_iterator)
+                    table_name = validate_table_name(settings.get("table_name"))
+                    normalized_settings = {
+                        "source": "table",
+                        "table_mode": table_mode,
+                        "table_name": table_name,
+                        "iterator": iterator,
+                        "column_name": validate_writer_column_name(settings.get("column_name") or iterator) if table_mode == "column" else "",
+                    }
+                else:
+                    iterator, inline_start = normalize_loop_iterator(settings.get("iterator", "i"))
+                    start_value = inline_start if inline_start is not None else int(settings.get("start_value", 0) or 0)
+                    if start_value < -100000 or start_value > 100000:
+                        raise ValueError("For loop iterator start must be between -100000 and 100000")
+                    normalized_settings = {
+                        "iterator": iterator,
+                        "start_value": start_value,
+                        "range_value": validate_loop_range(settings.get("range_value", ""), available_variable_names),
+                    }
             elif step_type == "use_js":
                 code = str(settings.get("code") or "").strip()
                 if not code:
@@ -364,13 +680,25 @@ def normalize_definition(
                 if not isinstance(raw_inputs, list):
                     raise ValueError("Use JS inputs must be an array of variables")
                 inputs = [normalize_variable_reference(item) for item in raw_inputs if str(item or "").strip()]
-                if any(item not in variable_names for item in inputs):
+                if any(item not in available_variable_names for item in inputs):
                     raise ValueError("Use JS inputs must reference existing variables")
                 output_reference = str(settings.get("output") or "").strip()
                 output = normalize_variable_reference(output_reference) if output_reference else ""
                 if output and output not in variable_names:
                     raise ValueError(f"Use JS output refers to unknown variable {output}")
-                normalized_settings = {"code": code, "inputs": inputs, "output": output}
+                normalized_settings = {
+                    "code": code,
+                    "inputs": inputs,
+                    "output": output,
+                    **normalize_post_action_wait(settings),
+                }
+            elif step_type == "writer":
+                columns = normalize_writer_columns(settings)
+                normalized_settings = {
+                    "value": str(settings.get("value") or ""),
+                    "table_name": validate_table_name(settings.get("table_name")),
+                    "columns": columns,
+                }
             else:
                 normalized_settings = {"selector": validate_selector(settings.get("selector"))}
 
@@ -378,17 +706,19 @@ def normalize_definition(
             raw_branches = raw_step.get("branches") or {}
             if step_type in {"check_element_exists", "check_text_exists"}:
                 branches = {
-                    "exists": normalize_steps(raw_branches.get("exists", []), "exists branch"),
-                    "not_exists": normalize_steps(raw_branches.get("not_exists", []), "not exists branch"),
+                    "exists": normalize_steps(raw_branches.get("exists", []), "exists branch", available_variable_names),
+                    "not_exists": normalize_steps(raw_branches.get("not_exists", []), "not exists branch", available_variable_names),
                 }
             elif step_type == "if":
                 branches = {
-                    "then": normalize_steps(raw_branches.get("then", []), "then branch"),
-                    "else": normalize_steps(raw_branches.get("else", []), "else branch"),
+                    "then": normalize_steps(raw_branches.get("then", []), "then branch", available_variable_names),
+                    "else": normalize_steps(raw_branches.get("else", []), "else branch", available_variable_names),
                 }
             elif step_type == "for":
+                loop_variable_names = set(available_variable_names)
+                loop_variable_names.add(normalized_settings["iterator"])
                 branches = {
-                    "body": normalize_steps(raw_branches.get("body", []), "for loop body"),
+                    "body": normalize_steps(raw_branches.get("body", []), "for loop body", loop_variable_names),
                 }
             normalized_steps.append(
                 {
@@ -406,7 +736,7 @@ def normalize_definition(
             )
         return normalized_steps
 
-    steps = normalize_steps(raw_steps)
+    steps = normalize_steps(raw_steps, "steps", variable_names)
     """
     for index, raw_step in enumerate(raw_steps):
         if not isinstance(raw_step, dict):
@@ -527,12 +857,15 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
     mode = definition.get("mode") or "headful"
     steps_literal = json.dumps(json.dumps(definition.get("steps", [])))
     variables_literal = json.dumps(json.dumps({item["name"]: item.get("value", "") for item in definition.get("variables", [])}))
+    writer_db_literal = json.dumps(str(DB_PATH))
     lines = [
         "import base64",
+        "import ast",
         "import ctypes",
         "import json",
         "import os",
         "import re",
+        "import sqlite3",
         "import time",
         "from rustwright.sync_api import sync_playwright",
         "",
@@ -541,9 +874,89 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "    time.sleep(seconds)",
         "",
         "",
+        "def wait_for_load_completion(page, timeout_ms=30000):",
+        "    try:",
+        "        page.wait_for_load_state('load', timeout=timeout_ms)",
+        "    except Exception as exc:",
+        "        message = str(exc).lower()",
+        "        if 'timeout' not in message and 'timed out' not in message:",
+        "            raise",
+        "        print('SUI_LOG:Page load did not complete before the 30 second limit; continuing', flush=True)",
+        "",
+        "",
+        "def evaluate_value_expression(expression, variables):",
+        "    tree = ast.parse(str(expression), mode='eval')",
+        "    def visit(node):",
+        "        if isinstance(node, ast.Expression): return visit(node.body)",
+        "        if isinstance(node, ast.Constant) and (node.value is None or isinstance(node.value, (str, int, float, bool))): return node.value",
+        "        if isinstance(node, ast.Name):",
+        "            if node.id not in variables: raise ValueError('Unknown variable: ' + node.id)",
+        "            return variables[node.id]",
+        "        if isinstance(node, ast.Attribute):",
+        "            owner = visit(node.value)",
+        "            if isinstance(owner, dict) and node.attr in owner: return owner[node.attr]",
+        "            raise ValueError('Unknown row column: ' + node.attr)",
+        "        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):",
+        "            left, right = visit(node.left), visit(node.right)",
+        "            return str(left) + str(right) if isinstance(left, str) or isinstance(right, str) else left + right",
+        "        raise ValueError('Only variables, quoted strings, and + are supported in value expressions')",
+        "    return visit(tree)",
+        "",
+        "",
         "def resolve(value, variables):",
         "    text = str(value or \"\")",
-        "    return re.sub(r\"\\{\\{?\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\}\\}?\", lambda match: str(variables.get(match.group(1), match.group(0))), text)",
+        "    pattern = re.compile(r\"\\{\\{?\\s*([^{}]+?)\\s*\\}\\}?\")",
+        "    def replace(match):",
+        "        try: return str(evaluate_value_expression(match.group(1).strip(), variables))",
+        "        except (SyntaxError, ValueError, TypeError, KeyError): return match.group(0)",
+        "    return pattern.sub(replace, text)",
+        "",
+        "",
+        f"WRITER_DB_PATH = {writer_db_literal}",
+        "",
+        "",
+        "def write_values_to_sqlite(table_name, columns):",
+        "    if not str(table_name or '').strip() or chr(0) in str(table_name): raise ValueError('Writer requires a valid table name')",
+        "    normalized = []",
+        "    for column in columns or []:",
+        "        name = str(column.get('name') or '').strip(); column_type = str(column.get('type') or 'TEXT').upper()",
+        "        if not name or chr(0) in name: raise ValueError('Writer column names must be non-empty')",
+        "        if column_type not in {'TEXT', 'INTEGER', 'REAL', 'BLOB', 'BOOLEAN', 'DATE', 'DATETIME'}: raise ValueError('Unsupported Writer column type: ' + column_type)",
+        "        normalized.append((name, column_type, column))",
+        "    if not normalized: raise ValueError('Writer requires at least one column')",
+        "    quoted_table = chr(34) + str(table_name).replace(chr(34), chr(34) * 2) + chr(34)",
+        "    os.makedirs(os.path.dirname(WRITER_DB_PATH), exist_ok=True)",
+        "    connection = sqlite3.connect(WRITER_DB_PATH)",
+        "    try:",
+        "        existing = {str(row[1]) for row in connection.execute(f'PRAGMA table_info({quoted_table})').fetchall()}",
+        "        if not existing:",
+        "            definitions = ', '.join(chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34) + ' ' + column_type for name, column_type, _ in normalized)",
+        "            connection.execute(f'CREATE TABLE IF NOT EXISTS {quoted_table} ({definitions})')",
+        "        else:",
+        "            for name, column_type, _ in normalized:",
+        "                if name not in existing: connection.execute(f'ALTER TABLE {quoted_table} ADD COLUMN {chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34)} {column_type}')",
+        "        writable = [(name, column) for name, _, column in normalized if column.get('write', True)]",
+        "        if writable:",
+        "            names = ', '.join(chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34) for name, _ in writable)",
+        "            placeholders = ', '.join('?' for _ in writable)",
+        "            connection.execute(f'INSERT INTO {quoted_table} ({names}) VALUES ({placeholders})', tuple(str(column.get('value') or '') for _, column in writable))",
+        "        else: connection.execute(f'INSERT INTO {quoted_table} DEFAULT VALUES')",
+        "        connection.commit()",
+        "    finally:",
+        "        connection.close()",
+        "",
+        "",
+        "def read_sqlite_table(table_name, column_name=None):",
+        "    table = str(table_name or '').strip(); column = str(column_name or '').strip() if column_name else ''",
+        "    if not table or chr(0) in table or chr(0) in column: raise ValueError('For loop requires a valid table and column')",
+        "    quote = lambda value: chr(34) + str(value).replace(chr(34), chr(34) * 2) + chr(34)",
+        "    connection = sqlite3.connect(WRITER_DB_PATH)",
+        "    connection.row_factory = sqlite3.Row",
+        "    try:",
+        "        if column: return [row[0] for row in connection.execute(f'SELECT {quote(column)} FROM {quote(table)}').fetchall()]",
+        "        return [dict(row) for row in connection.execute(f'SELECT * FROM {quote(table)}').fetchall()]",
+        "    finally:",
+        "        connection.close()",
         "",
         "",
         "def resolve_loop_range(value, variables):",
@@ -581,9 +994,67 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "    return locator",
         "",
         "",
+        "def page_url(page):",
+        "    try: return str(page.url)",
+        "    except Exception: return '<unavailable>'",
+        "",
+        "",
+        "def page_description(page):",
+        "    try:",
+        "        pages = list(page.context.pages)",
+        "        page_index = next((index for index, item in enumerate(pages) if item is page), '?')",
+        "    except Exception:",
+        "        page_index = '?'",
+        "    return f'active_page={page_index} url={page_url(page)}'",
+        "",
+        "",
+        "def context_pages(page):",
+        "    try: return list(page.context.pages)",
+        "    except Exception: return [page]",
+        "",
+        "",
+        "def new_pages(page, before_pages):",
+        "    candidates = [candidate for candidate in context_pages(page) if not any(candidate is old for old in before_pages)]",
+        "    for candidate in candidates: PAGE_OPENERS[id(candidate)] = page",
+        "    return candidates",
+        "",
+        "",
+        "def destination_matches(page, expected_url, destination_selector):",
+        "    if expected_url:",
+        "        current_url = page_url(page)",
+        "        if current_url != expected_url and expected_url not in current_url:",
+        "            return False",
+        "    if destination_selector:",
+        "        if locator_for(page, destination_selector).first.count() < 1:",
+        "            return False",
+        "    return True",
+        "",
+        "",
+        "def wait_for_action_destination(page, before_pages, settings, action):",
+        "    expected_url = resolve(settings.get('expected_url'), variables).strip()",
+        "    destination_selector = resolve(settings.get('destination_selector'), variables).strip()",
+        "    timeout_seconds = min(max(float(settings.get('wait_timeout_seconds', 15)), 0.1), 120.0)",
+        "    if not expected_url and not destination_selector:",
+        "        candidates = new_pages(page, before_pages)",
+        "        return candidates[-1] if candidates else page",
+        "    deadline = time.monotonic() + timeout_seconds",
+        "    while True:",
+        "        candidates = new_pages(page, before_pages)",
+        "        for candidate in [*candidates, page]:",
+        "            if destination_matches(candidate, expected_url, destination_selector):",
+        "                return candidate",
+        "        if time.monotonic() >= deadline:",
+        "            condition = f'expected_url={expected_url!r} destination_selector={destination_selector!r}'",
+        "            raise TimeoutError(f'{action} destination wait timed out ({condition}); {page_description(page)}')",
+        "        time.sleep(0.05)",
+        "",
+        "",
         "def emit_frame(page):",
-        "    frame = page.screenshot(type=\"jpeg\", quality=70)",
-        "    print(\"SUI_FRAME:\" + base64.b64encode(frame).decode(\"ascii\"), flush=True)",
+        "    try:",
+        "        frame = page.screenshot(type=\"jpeg\", quality=70)",
+        "        print(\"SUI_FRAME:\" + base64.b64encode(frame).decode(\"ascii\"), flush=True)",
+        "    except Exception as exc:",
+        "        print(\"SUI_FRAME_ERROR:\" + str(exc), flush=True)",
         "",
         "",
         "USE_JS_RUNNER = \"\"\"async ({body, args}) => { const source = 'return (async function suiJSRunner(args) {' + String(body || '') + '\\\\n})(args);'; const runner = new Function('args', source); return await runner(args); }\"\"\"",
@@ -612,61 +1083,103 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "",
         f"recipe_steps = json.loads({steps_literal})",
         f"variables = json.loads({variables_literal})",
+        "PAGE_OPENERS = {}",
+        "PAGE_SOURCES = {}",
         "",
         "",
         "def execute_step(page, step):",
-        "    if step.get('disabled'): return",
+        "    if step.get('disabled'): return page",
         "    settings = step.get('settings') or {}",
         "    step_type = step.get('type')",
         "    if step_type == 'navigate_to_website':",
         "        human_pause(0.35); page.goto(resolve(settings.get('url'), variables), wait_until='domcontentloaded'); human_pause(0.65)",
         "    elif step_type == 'navigate':",
         "        action = settings.get('action', 'back'); human_pause(0.30)",
-        "        if action == 'back': page.go_back(wait_until='commit')",
+        "        if action == 'back':",
+        "            opener = PAGE_OPENERS.get(id(page))",
+        "            source_url = PAGE_SOURCES.get(id(page))",
+        "            previous_url = page_url(page)",
+        "            try:",
+        "                page.go_back(wait_until='commit')",
+        "            except Exception:",
+        "                if not opener: raise",
+        "                try: page.close()",
+        "                except Exception: pass",
+        "                page = opener",
+        "            else:",
+        "                if opener and (page_url(page) == previous_url or page_url(page).startswith('about:')):",
+        "                    try: page.close()",
+        "                    except Exception: pass",
+        "                    page = opener",
+        "                elif source_url and page_url(page) == previous_url and source_url != previous_url:",
+        "                    page.goto(source_url, wait_until='commit')",
         "        elif action == 'forward': page.go_forward(wait_until='commit')",
         "        elif action == 'refresh': page.reload(wait_until='commit')",
         "        else: raise ValueError('Unsupported Navigate action: ' + str(action))",
         "        human_pause(0.45)",
         "    elif step_type == 'click':",
-        "        human_pause(0.30); wait_for_locator(page, resolve(settings.get('selector'), variables), 'Click').click(); human_pause(0.35)",
+        "        source_url = page_url(page); before_pages = context_pages(page); human_pause(0.30)",
+        "        target = wait_for_locator(page, resolve(settings.get('selector'), variables), 'Click')",
+        "        try:",
+        "            target.click()",
+        "        except Exception as exc:",
+        "            navigated = page_url(page) != source_url or bool(new_pages(page, before_pages))",
+        "            if not navigated: raise",
+        "            print(f\"SUI_LOG:Click raised after navigation; continuing; command_id={step.get('command_id', '')}; error={exc}\", flush=True)",
+        "        page = wait_for_action_destination(page, before_pages, settings, 'Click'); PAGE_SOURCES[id(page)] = source_url; human_pause(0.35)",
         "    elif step_type == 'fill':",
         "        human_pause(0.30); wait_for_locator(page, resolve(settings.get('selector'), variables), 'Fill').fill(resolve(settings.get('value'), variables)); human_pause(0.35)",
         "    elif step_type == 'delay':",
-        "        if settings.get('until_load_completes'): page.wait_for_load_state('load')",
+        "        if settings.get('until_load_completes'): wait_for_load_completion(page)",
         "        else: time.sleep(float(settings.get('seconds', 1)))",
         "    elif step_type == 'keypress':",
-        "        human_pause(0.25); page.keyboard.press(str(settings.get('key') or 'Enter')); human_pause(0.25)",
+        "        source_url = page_url(page); before_pages = context_pages(page); human_pause(0.25); page.keyboard.press(str(settings.get('key') or 'Enter')); page = wait_for_action_destination(page, before_pages, settings, 'Keypress'); PAGE_SOURCES[id(page)] = source_url; human_pause(0.25)",
         "    elif step_type == 'assign':",
         "        variables[settings.get('variable')] = resolve(settings.get('value'), variables); human_pause(0.25)",
         "    elif step_type == 'scrape':",
         "        variables[settings.get('variable')] = wait_for_locator(page, resolve(settings.get('selector'), variables), 'Scrape').inner_text(); human_pause(0.30)",
         "    elif step_type == 'message_box':",
         f"        show_message_box(page, resolve(settings.get('message'), variables)); page.locator('#sui-message-box-ok').click() if {json.dumps(mode)} == 'headless' else page.wait_for_function(\"() => !document.getElementById('sui-message-box')\")",
+        "    elif step_type == 'writer':",
+        "        writer_columns = [dict(column, value=resolve(column.get('value'), variables)) for column in (settings.get('columns') or [{'name': 'value', 'type': 'TEXT', 'value': settings.get('value', ''), 'write': True}])]; write_values_to_sqlite(settings.get('table_name'), writer_columns); human_pause(0.25)",
         "    elif step_type == 'check_element_exists':",
         "        selector = resolve(settings.get('selector'), variables); locator = locator_for(page, selector)",
         "        try:",
         "            locator.wait_for(state='attached', timeout=int(float(settings.get('timeout_seconds', 5)) * 1000)); exists = True",
         "        except Exception:",
         "            exists = False",
-        "        execute_steps(page, (step.get('branches') or {}).get('exists' if exists else 'not_exists', []))",
+        "        page = execute_steps(page, (step.get('branches') or {}).get('exists' if exists else 'not_exists', []))",
         "    elif step_type == 'check_text_exists':",
         "        expected = resolve(settings.get('text'), variables); timeout = float(settings.get('timeout_seconds', 5)); deadline = time.monotonic() + timeout; exists = False",
         "        while time.monotonic() < deadline:",
         "            body = page.locator('body').inner_text(); exists = expected.lower() in body.lower() if settings.get('case_insensitive', True) else expected in body",
         "            if exists: break",
         "            time.sleep(0.2)",
-        "        execute_steps(page, (step.get('branches') or {}).get('exists' if exists else 'not_exists', []))",
+        "        page = execute_steps(page, (step.get('branches') or {}).get('exists' if exists else 'not_exists', []))",
         "    elif step_type == 'if':",
-        "        matched = evaluate_condition(settings.get('left'), settings.get('operator', '='), settings.get('right'), variables); execute_steps(page, (step.get('branches') or {}).get('then' if matched else 'else', []))",
+        "        matched = evaluate_condition(settings.get('left'), settings.get('operator', '='), settings.get('right'), variables); page = execute_steps(page, (step.get('branches') or {}).get('then' if matched else 'else', []))",
         "    elif step_type == 'for':",
-        "        loop_count = resolve_loop_range(settings.get('range_value'), variables); loop_start = int(settings.get('start_value', 0)); iterator = settings.get('iterator') or 'i'",
-        "        if loop_count < 0: raise ValueError('For loop range must not be negative')",
-        "        for loop_index in range(loop_start, loop_start + loop_count): variables[iterator] = loop_index; execute_steps(page, (step.get('branches') or {}).get('body', []))",
+        "        if settings.get('source') == 'table':",
+        "            table_name = resolve(settings.get('table_name'), variables); table_mode = settings.get('table_mode') or 'row'; iterator = settings.get('iterator') or ('row' if table_mode == 'row' else 'value'); column_name = resolve(settings.get('column_name'), variables) if table_mode == 'column' else None; loop_iterable = enumerate(read_sqlite_table(table_name, column_name))",
+        "        else:",
+        "            loop_count = resolve_loop_range(settings.get('range_value'), variables); loop_start = int(settings.get('start_value', 0)); iterator = settings.get('iterator') or 'i'",
+        "            if loop_count < 0: raise ValueError('For loop range must not be negative')",
+        "            loop_iterable = ((loop_index, loop_index) for loop_index in range(loop_start, loop_start + loop_count))",
+        "        for loop_index, loop_value in loop_iterable:",
+        "            variables[iterator] = loop_value",
+        "            print(f\"SUI_LOG:For loop iteration {loop_index} started\", flush=True)",
+        "            try:",
+        "                page = execute_steps(page, (step.get('branches') or {}).get('body', []))",
+        "            except Exception as exc:",
+        "                print(f\"SUI_LOG:For loop iteration {loop_index} failed; {page_description(page)}; error={type(exc).__name__}: {exc}\", flush=True)",
+        "                raise",
+        "            print(f\"SUI_LOG:For loop iteration {loop_index} completed\", flush=True)",
         "    elif step_type == 'use_js':",
-        "        args = [variables.get(name, '') for name in (settings.get('inputs') or [])]; result = page.evaluate(USE_JS_RUNNER, {'body': settings.get('code', ''), 'args': args}); output_name = settings.get('output')",
+        "        source_url = page_url(page); before_pages = context_pages(page); args = [variables.get(name, '') for name in (settings.get('inputs') or [])]; result = page.evaluate(USE_JS_RUNNER, {'body': settings.get('code', ''), 'args': args}); page = wait_for_action_destination(page, before_pages, settings, 'Use JS'); PAGE_SOURCES[id(page)] = source_url; output_name = settings.get('output')",
         "        if output_name: variables[output_name] = result",
         "    else:",
         "        raise ValueError('Unsupported activity: ' + str(step_type))",
+        "    return page",
         "",
         "",
         "def execute_steps(page, steps):",
@@ -676,9 +1189,14 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
         "            continue",
         "        step_id = step.get('id', 'step')",
         "        print(f\"SUI_LOG:Step started: {step_id} ({step.get('type')})\", flush=True)",
-        "        execute_step(page, step)",
+        "        try:",
+        "            page = execute_step(page, step)",
+        "        except Exception as exc:",
+        "            print(f\"SUI_LOG:Step failed: {step_id} ({step.get('type')}); {page_description(page)}; error={type(exc).__name__}: {exc}\", flush=True)",
+        "            raise",
         "        emit_frame(page)",
         "        print(f\"SUI_LOG:Step completed: {step_id} ({step.get('type')})\", flush=True)",
+        "    return page",
         "",
         "",
     ]
@@ -698,7 +1216,7 @@ def _generate_recursive_sync_python(definition: dict[str, Any]) -> str:
             "        restore_foreground_window(foreground_window)",
             "        try:",
             "            emit_frame(page)",
-            "            execute_steps(page, recipe_steps)",
+            "            page = execute_steps(page, recipe_steps)",
             "        finally:",
             "            try:",
             "                if browser: browser.close()",
@@ -935,13 +1453,16 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
     mode = definition.get("mode") or "headful"
     step_literal = json.dumps(json.dumps((definition.get("steps") or [{}])[0]))
     variables_literal = json.dumps(json.dumps({item["name"]: item.get("value", "") for item in definition.get("variables", [])}))
+    writer_db_literal = json.dumps(str(DB_PATH))
     lines = [
         "import asyncio",
+        "import ast",
         "import base64",
         "import ctypes",
         "import json",
         "import os",
         "import re",
+        "import sqlite3",
         "import sys",
         "import time",
         "from rustwright.async_api import async_playwright",
@@ -951,9 +1472,76 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "    await asyncio.sleep(seconds)",
         "",
         "",
+        "async def wait_for_load_completion(page, timeout_ms=30000):",
+        "    try:",
+        "        await page.wait_for_load_state('load', timeout=timeout_ms)",
+        "    except Exception as exc:",
+        "        message = str(exc).lower()",
+        "        if 'timeout' not in message and 'timed out' not in message:",
+        "            raise",
+        "        print('SUI_LOG:Page load did not complete before the 30 second limit; continuing', flush=True)",
+        "",
+        "",
+        "def evaluate_value_expression(expression, variables):",
+        "    tree = ast.parse(str(expression), mode='eval')",
+        "    def visit(node):",
+        "        if isinstance(node, ast.Expression): return visit(node.body)",
+        "        if isinstance(node, ast.Constant) and (node.value is None or isinstance(node.value, (str, int, float, bool))): return node.value",
+        "        if isinstance(node, ast.Name):",
+        "            if node.id not in variables: raise ValueError('Unknown variable: ' + node.id)",
+        "            return variables[node.id]",
+        "        if isinstance(node, ast.Attribute):",
+        "            owner = visit(node.value)",
+        "            if isinstance(owner, dict) and node.attr in owner: return owner[node.attr]",
+        "            raise ValueError('Unknown row column: ' + node.attr)",
+        "        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):",
+        "            left, right = visit(node.left), visit(node.right)",
+        "            return str(left) + str(right) if isinstance(left, str) or isinstance(right, str) else left + right",
+        "        raise ValueError('Only variables, quoted strings, and + are supported in value expressions')",
+        "    return visit(tree)",
+        "",
+        "",
         "def resolve(value, variables):",
         "    text = str(value or \"\")",
-        "    return re.sub(r\"\\{\\{?\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\}\\}?\", lambda match: str(variables.get(match.group(1), match.group(0))), text)",
+        "    pattern = re.compile(r\"\\{\\{?\\s*([^{}]+?)\\s*\\}\\}?\")",
+        "    def replace(match):",
+        "        try: return str(evaluate_value_expression(match.group(1).strip(), variables))",
+        "        except (SyntaxError, ValueError, TypeError, KeyError): return match.group(0)",
+        "    return pattern.sub(replace, text)",
+        "",
+        "",
+        f"WRITER_DB_PATH = {writer_db_literal}",
+        "",
+        "",
+        "def write_values_to_sqlite(table_name, columns):",
+        "    if not str(table_name or '').strip() or chr(0) in str(table_name): raise ValueError('Writer requires a valid table name')",
+        "    normalized = []",
+        "    for column in columns or []:",
+        "        name = str(column.get('name') or '').strip(); column_type = str(column.get('type') or 'TEXT').upper()",
+        "        if not name or chr(0) in name: raise ValueError('Writer column names must be non-empty')",
+        "        if column_type not in {'TEXT', 'INTEGER', 'REAL', 'BLOB', 'BOOLEAN', 'DATE', 'DATETIME'}: raise ValueError('Unsupported Writer column type: ' + column_type)",
+        "        normalized.append((name, column_type, column))",
+        "    if not normalized: raise ValueError('Writer requires at least one column')",
+        "    quoted_table = chr(34) + str(table_name).replace(chr(34), chr(34) * 2) + chr(34)",
+        "    os.makedirs(os.path.dirname(WRITER_DB_PATH), exist_ok=True)",
+        "    connection = sqlite3.connect(WRITER_DB_PATH)",
+        "    try:",
+        "        existing = {str(row[1]) for row in connection.execute(f'PRAGMA table_info({quoted_table})').fetchall()}",
+        "        if not existing:",
+        "            definitions = ', '.join(chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34) + ' ' + column_type for name, column_type, _ in normalized)",
+        "            connection.execute(f'CREATE TABLE IF NOT EXISTS {quoted_table} ({definitions})')",
+        "        else:",
+        "            for name, column_type, _ in normalized:",
+        "                if name not in existing: connection.execute(f'ALTER TABLE {quoted_table} ADD COLUMN {chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34)} {column_type}')",
+        "        writable = [(name, column) for name, _, column in normalized if column.get('write', True)]",
+        "        if writable:",
+        "            names = ', '.join(chr(34) + name.replace(chr(34), chr(34) * 2) + chr(34) for name, _ in writable)",
+        "            placeholders = ', '.join('?' for _ in writable)",
+        "            connection.execute(f'INSERT INTO {quoted_table} ({names}) VALUES ({placeholders})', tuple(str(column.get('value') or '') for _, column in writable))",
+        "        else: connection.execute(f'INSERT INTO {quoted_table} DEFAULT VALUES')",
+        "        connection.commit()",
+        "    finally:",
+        "        connection.close()",
         "",
         "",
         "def resolve_loop_range(value, variables):",
@@ -970,10 +1558,26 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "USE_JS_RUNNER = \"\"\"async ({body, args}) => { const source = 'return (async function suiJSRunner(args) {' + String(body || '') + '\\\\n})(args);'; const runner = new Function('args', source); return await runner(args); }\"\"\"",
         "",
         "",
+        "def read_sqlite_table(table_name, column_name=None):",
+        "    table = str(table_name or '').strip(); column = str(column_name or '').strip() if column_name else ''",
+        "    if not table or chr(0) in table or chr(0) in column: raise ValueError('For loop requires a valid table and column')",
+        "    quote = lambda value: chr(34) + str(value).replace(chr(34), chr(34) * 2) + chr(34)",
+        "    connection = sqlite3.connect(WRITER_DB_PATH)",
+        "    connection.row_factory = sqlite3.Row",
+        "    try:",
+        "        if column: return [row[0] for row in connection.execute(f'SELECT {quote(column)} FROM {quote(table)}').fetchall()]",
+        "        return [dict(row) for row in connection.execute(f'SELECT * FROM {quote(table)}').fetchall()]",
+        "    finally:",
+        "        connection.close()",
+        "",
+        "",
         "async def emit_frame(page, capture_lock):",
         "    async with capture_lock:",
-        "        frame = await page.screenshot(type=\"jpeg\", quality=70)",
-        "        print(\"SUI_FRAME:\" + base64.b64encode(frame).decode(\"ascii\"), flush=True)",
+        "        try:",
+        "            frame = await page.screenshot(type=\"jpeg\", quality=70)",
+        "            print(\"SUI_FRAME:\" + base64.b64encode(frame).decode(\"ascii\"), flush=True)",
+        "        except Exception as exc:",
+        "            print(\"SUI_FRAME_ERROR:\" + str(exc), flush=True)",
         "",
         "",
         "def async_locator_for(page, selector):",
@@ -1000,6 +1604,61 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "    return locator",
         "",
         "",
+        "def page_url(page):",
+        "    try: return str(page.url)",
+        "    except Exception: return '<unavailable>'",
+        "",
+        "",
+        "def page_description(page):",
+        "    try:",
+        "        pages = list(page.context.pages)",
+        "        page_index = next((index for index, item in enumerate(pages) if item is page), '?')",
+        "    except Exception:",
+        "        page_index = '?'",
+        "    return f'active_page={page_index} url={page_url(page)}'",
+        "",
+        "",
+        "def context_pages(page):",
+        "    try: return list(page.context.pages)",
+        "    except Exception: return [page]",
+        "",
+        "",
+        "def new_pages(page, before_pages):",
+        "    candidates = [candidate for candidate in context_pages(page) if not any(candidate is old for old in before_pages)]",
+        "    for candidate in candidates: PAGE_OPENERS[id(candidate)] = page",
+        "    return candidates",
+        "",
+        "",
+        "async def destination_matches(page, expected_url, destination_selector):",
+        "    if expected_url:",
+        "        current_url = page_url(page)",
+        "        if current_url != expected_url and expected_url not in current_url:",
+        "            return False",
+        "    if destination_selector:",
+        "        if await async_locator_for(page, destination_selector).first.count() < 1:",
+        "            return False",
+        "    return True",
+        "",
+        "",
+        "async def wait_for_action_destination(page, before_pages, settings, action):",
+        "    expected_url = resolve(settings.get('expected_url'), variables).strip()",
+        "    destination_selector = resolve(settings.get('destination_selector'), variables).strip()",
+        "    timeout_seconds = min(max(float(settings.get('wait_timeout_seconds', 15)), 0.1), 120.0)",
+        "    if not expected_url and not destination_selector:",
+        "        candidates = new_pages(page, before_pages)",
+        "        return candidates[-1] if candidates else page",
+        "    deadline = asyncio.get_running_loop().time() + timeout_seconds",
+        "    while True:",
+        "        candidates = new_pages(page, before_pages)",
+        "        for candidate in [*candidates, page]:",
+        "            if await destination_matches(candidate, expected_url, destination_selector):",
+        "                return candidate",
+        "        if asyncio.get_running_loop().time() >= deadline:",
+        "            condition = f'expected_url={expected_url!r} destination_selector={destination_selector!r}'",
+        "            raise TimeoutError(f'{action} destination wait timed out ({condition}); {page_description(page)}')",
+        "        await asyncio.sleep(0.05)",
+        "",
+        "",
         "async def show_message_box(page, message):",
         "    await page.evaluate(\"\"\"(text) => { const old = document.getElementById('sui-message-box'); if (old) old.remove(); const overlay = document.createElement('div'); overlay.id = 'sui-message-box'; Object.assign(overlay.style, { position: 'fixed', inset: '0', zIndex: '2147483647', display: 'grid', placeItems: 'center', background: 'rgba(20, 25, 22, .35)' }); const box = document.createElement('div'); Object.assign(box.style, { padding: '24px', borderRadius: '12px', background: '#fff', color: '#17201d' }); const copy = document.createElement('div'); copy.textContent = text; copy.style.marginBottom = '20px'; const ok = document.createElement('button'); ok.id = 'sui-message-box-ok'; ok.textContent = 'OK'; ok.onclick = () => overlay.remove(); box.append(copy, ok); overlay.append(box); document.body.append(overlay); }\"\"\", message)",
         "",
@@ -1020,29 +1679,56 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "",
         f"selected_step = json.loads({step_literal})",
         f"variables = json.loads({variables_literal})",
+        "PAGE_OPENERS = {}",
+        "PAGE_SOURCES = {}",
         "",
         "",
         "async def execute_step(page, step, capture_lock):",
-        "    if step.get('disabled'): return",
+        "    if step.get('disabled'): return page",
         "    settings = step.get('settings') or {}; step_type = step.get('type')",
         "    if step_type == 'navigate_to_website':",
         "        await human_pause(0.35); await page.goto(resolve(settings.get('url'), variables), wait_until='domcontentloaded'); await human_pause(0.65)",
         "    elif step_type == 'navigate':",
         "        action = settings.get('action', 'back'); await human_pause(0.30)",
-        "        if action == 'back': await page.go_back(wait_until='commit')",
+        "        if action == 'back':",
+        "            opener = PAGE_OPENERS.get(id(page))",
+        "            source_url = PAGE_SOURCES.get(id(page))",
+        "            previous_url = page_url(page)",
+        "            try:",
+        "                await page.go_back(wait_until='commit')",
+        "            except Exception:",
+        "                if not opener: raise",
+        "                try: await page.close()",
+        "                except Exception: pass",
+        "                page = opener",
+        "            else:",
+        "                if opener and (page_url(page) == previous_url or page_url(page).startswith('about:')):",
+        "                    try: await page.close()",
+        "                    except Exception: pass",
+        "                    page = opener",
+        "                elif source_url and page_url(page) == previous_url and source_url != previous_url:",
+        "                    await page.goto(source_url, wait_until='commit')",
         "        elif action == 'forward': await page.go_forward(wait_until='commit')",
         "        elif action == 'refresh': await page.reload(wait_until='commit')",
         "        else: raise ValueError('Unsupported Navigate action: ' + str(action))",
         "        await human_pause(0.45)",
         "    elif step_type == 'click':",
-        "        await human_pause(0.30); await (await wait_for_locator(page, resolve(settings.get('selector'), variables), 'Click')).click(); await human_pause(0.35)",
+        "        source_url = page_url(page); before_pages = context_pages(page); await human_pause(0.30)",
+        "        target = await wait_for_locator(page, resolve(settings.get('selector'), variables), 'Click')",
+        "        try:",
+        "            await target.click()",
+        "        except Exception as exc:",
+        "            navigated = page_url(page) != source_url or bool(new_pages(page, before_pages))",
+        "            if not navigated: raise",
+        "            print(f\"SUI_LOG:Click raised after navigation; continuing; command_id={step.get('command_id', '')}; error={exc}\", flush=True)",
+        "        page = await wait_for_action_destination(page, before_pages, settings, 'Click'); PAGE_SOURCES[id(page)] = source_url; await human_pause(0.35)",
         "    elif step_type == 'fill':",
         "        await human_pause(0.30); await (await wait_for_locator(page, resolve(settings.get('selector'), variables), 'Fill')).fill(resolve(settings.get('value'), variables)); await human_pause(0.35)",
         "    elif step_type == 'delay':",
-        "        if settings.get('until_load_completes'): await page.wait_for_load_state('load')",
+        "        if settings.get('until_load_completes'): await wait_for_load_completion(page)",
         "        else: await asyncio.sleep(float(settings.get('seconds', 1)))",
         "    elif step_type == 'keypress':",
-        "        await human_pause(0.25); await page.keyboard.press(str(settings.get('key') or 'Enter')); await human_pause(0.25)",
+        "        source_url = page_url(page); before_pages = context_pages(page); await human_pause(0.25); await page.keyboard.press(str(settings.get('key') or 'Enter')); page = await wait_for_action_destination(page, before_pages, settings, 'Keypress'); PAGE_SOURCES[id(page)] = source_url; await human_pause(0.25)",
         "    elif step_type == 'assign':",
         "        variables[settings.get('variable')] = resolve(settings.get('value'), variables); await human_pause(0.25)",
         "    elif step_type == 'scrape':",
@@ -1051,31 +1737,46 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "        await show_message_box(page, resolve(settings.get('message'), variables))",
         f"        if {json.dumps(mode)} == 'headless': await page.locator('#sui-message-box-ok').click()",
         "        else: await page.wait_for_function(\"() => !document.getElementById('sui-message-box')\")",
+        "    elif step_type == 'writer':",
+        "        writer_columns = [dict(column, value=resolve(column.get('value'), variables)) for column in (settings.get('columns') or [{'name': 'value', 'type': 'TEXT', 'value': settings.get('value', ''), 'write': True}])]; await asyncio.to_thread(write_values_to_sqlite, settings.get('table_name'), writer_columns); await human_pause(0.25)",
         "    elif step_type == 'check_element_exists':",
         "        selector = resolve(settings.get('selector'), variables); locator = async_locator_for(page, selector)",
         "        try:",
         "            await locator.wait_for(state='attached', timeout=int(float(settings.get('timeout_seconds', 5)) * 1000)); exists = True",
         "        except Exception:",
         "            exists = False",
-        "        await execute_steps(page, (step.get('branches') or {}).get('exists' if exists else 'not_exists', []), capture_lock)",
+        "        page = await execute_steps(page, (step.get('branches') or {}).get('exists' if exists else 'not_exists', []), capture_lock)",
         "    elif step_type == 'check_text_exists':",
         "        expected = resolve(settings.get('text'), variables); timeout = float(settings.get('timeout_seconds', 5)); deadline = asyncio.get_running_loop().time() + timeout; exists = False",
         "        while asyncio.get_running_loop().time() < deadline:",
         "            body = await page.locator('body').inner_text(); exists = expected.lower() in body.lower() if settings.get('case_insensitive', True) else expected in body",
         "            if exists: break",
         "            await asyncio.sleep(0.2)",
-        "        await execute_steps(page, (step.get('branches') or {}).get('exists' if exists else 'not_exists', []), capture_lock)",
+        "        page = await execute_steps(page, (step.get('branches') or {}).get('exists' if exists else 'not_exists', []), capture_lock)",
         "    elif step_type == 'if':",
-        "        matched = await evaluate_condition(settings.get('left'), settings.get('operator', '='), settings.get('right'), variables); await execute_steps(page, (step.get('branches') or {}).get('then' if matched else 'else', []), capture_lock)",
+        "        matched = await evaluate_condition(settings.get('left'), settings.get('operator', '='), settings.get('right'), variables); page = await execute_steps(page, (step.get('branches') or {}).get('then' if matched else 'else', []), capture_lock)",
         "    elif step_type == 'for':",
-        "        loop_count = resolve_loop_range(settings.get('range_value'), variables); loop_start = int(settings.get('start_value', 0)); iterator = settings.get('iterator') or 'i'",
-        "        if loop_count < 0: raise ValueError('For loop range must not be negative')",
-        "        for loop_index in range(loop_start, loop_start + loop_count): variables[iterator] = loop_index; await execute_steps(page, (step.get('branches') or {}).get('body', []), capture_lock)",
+        "        if settings.get('source') == 'table':",
+        "            table_name = resolve(settings.get('table_name'), variables); table_mode = settings.get('table_mode') or 'row'; iterator = settings.get('iterator') or ('row' if table_mode == 'row' else 'value'); column_name = resolve(settings.get('column_name'), variables) if table_mode == 'column' else None; loop_values = await asyncio.to_thread(read_sqlite_table, table_name, column_name); loop_iterable = enumerate(loop_values)",
+        "        else:",
+        "            loop_count = resolve_loop_range(settings.get('range_value'), variables); loop_start = int(settings.get('start_value', 0)); iterator = settings.get('iterator') or 'i'",
+        "            if loop_count < 0: raise ValueError('For loop range must not be negative')",
+        "            loop_iterable = ((loop_index, loop_index) for loop_index in range(loop_start, loop_start + loop_count))",
+        "        for loop_index, loop_value in loop_iterable:",
+        "            variables[iterator] = loop_value",
+        "            print(f\"SUI_LOG:For loop iteration {loop_index} started\", flush=True)",
+        "            try:",
+        "                page = await execute_steps(page, (step.get('branches') or {}).get('body', []), capture_lock)",
+        "            except Exception as exc:",
+        "                print(f\"SUI_LOG:For loop iteration {loop_index} failed; {page_description(page)}; error={type(exc).__name__}: {exc}\", flush=True)",
+        "                raise",
+        "            print(f\"SUI_LOG:For loop iteration {loop_index} completed\", flush=True)",
         "    elif step_type == 'use_js':",
-        "        args = [variables.get(name, '') for name in (settings.get('inputs') or [])]; result = await page.evaluate(USE_JS_RUNNER, {'body': settings.get('code', ''), 'args': args}); output_name = settings.get('output')",
+        "        source_url = page_url(page); before_pages = context_pages(page); args = [variables.get(name, '') for name in (settings.get('inputs') or [])]; result = await page.evaluate(USE_JS_RUNNER, {'body': settings.get('code', ''), 'args': args}); page = await wait_for_action_destination(page, before_pages, settings, 'Use JS'); PAGE_SOURCES[id(page)] = source_url; output_name = settings.get('output')",
         "        if output_name: variables[output_name] = result",
         "    else:",
         "        raise ValueError('Unsupported activity: ' + str(step_type))",
+        "    return page",
         "",
         "",
         "async def execute_steps(page, steps, capture_lock):",
@@ -1085,9 +1786,14 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "            continue",
         "        step_id = step.get('id', 'step')",
         "        print(f\"SUI_LOG:Step started: {step_id} ({step.get('type')})\", flush=True)",
-        "        await execute_step(page, step, capture_lock)",
+        "        try:",
+        "            page = await execute_step(page, step, capture_lock)",
+        "        except Exception as exc:",
+        "            print(f\"SUI_LOG:Step failed: {step_id} ({step.get('type')}); {page_description(page)}; error={type(exc).__name__}: {exc}\", flush=True)",
+        "            raise",
         "        await emit_frame(page, capture_lock)",
         "        print(f\"SUI_LOG:Step completed: {step_id} ({step.get('type')})\", flush=True)",
+        "    return page",
         "",
         "",
         "async def inspect_at(page, x, y):",
@@ -1142,15 +1848,16 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "async def clear_picker_target(page):",
         "    await page.evaluate(\"\"\"() => { const overlay = document.getElementById('__sui_picker_highlight__'); if (overlay) overlay.remove(); }\"\"\")",
         "",
-        "async def execute_command(page, command, capture_lock):",
+        "async def execute_command(session, command, capture_lock):",
         "    command_type = command.get('type')",
+        "    page = session['page']",
         "    try:",
         "        action_result = None",
         "        if command_type == 'run_step':",
-        "            step = command.get('step') or {}; await execute_step(page, step, capture_lock); action_result = {'status': 'completed', 'action': step.get('type'), 'command_id': command.get('command_id')}"
+        "            step = command.get('step') or {}; page = await execute_step(page, step, capture_lock); action_result = {'status': 'completed', 'action': step.get('type'), 'command_id': command.get('command_id')}"
         ,
         "        elif command_type == 'delay':",
-        "            if command.get('until_load_completes'): await page.wait_for_load_state('load')",
+        "            if command.get('until_load_completes'): await wait_for_load_completion(page)",
         "            else: await asyncio.sleep(float(command.get('seconds') or 0))",
         "            action_result = {'status': 'completed', 'action': 'delay', 'command_id': command.get('command_id')}"
         ,
@@ -1182,6 +1889,7 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         ,
         "        else: return"
         ,
+        "        session['page'] = page",
         "        await emit_frame(page, capture_lock)"
         ,
         "        if action_result is not None: print('SUI_ACTION_COMPLETE:' + json.dumps(action_result), flush=True)"
@@ -1192,10 +1900,15 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "        print('SUI_ACTION_COMPLETE:' + json.dumps({'status': 'cancelled', 'error': 'Superseded by a newer command', 'trial_id': command.get('trial_id'), 'command_id': command.get('command_id')}), flush=True)",
         "        raise",
         "    except Exception as exc:",
+        "        session['page'] = page",
+        "        failed_step = command.get('step') or {}",
+        "        print(f\"SUI_LOG:Step failed: {failed_step.get('id', command_type)} ({failed_step.get('type', command_type)}); {page_description(page)}; command_id={command.get('command_id', '')}; error={exc}\", flush=True)",
         "        if command_type in {'run_step', 'delay', 'assign', 'navigate', 'selector_click', 'selector_fill', 'selector_scrape', 'selector_check', 'message_box', 'inspect', 'inspect_move', 'clear_picker_overlay'}: print('SUI_ACTION_COMPLETE:' + json.dumps({'status': 'failed', 'error': str(exc), 'trial_id': command.get('trial_id'), 'command_id': command.get('command_id')}), flush=True)",
+        "    return page",
         "",
         "",
-        "async def command_loop(page, capture_lock):",
+        "async def command_loop(session, capture_lock):",
+        "    page = session['page']",
         "    current_task = None",
         "    executable_types = {'run_step', 'delay', 'assign', 'navigate', 'selector_click', 'selector_fill', 'selector_scrape', 'selector_check', 'message_box'}",
         "    while True:",
@@ -1210,12 +1923,13 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
         "            current_task = None",
         "            continue",
         "        if current_task and current_task.done():",
-        "            await asyncio.gather(current_task, return_exceptions=True)",
+        "            result = await asyncio.gather(current_task, return_exceptions=True)",
+        "            if result and not isinstance(result[0], BaseException): page = result[0]; session['page'] = page",
         "            current_task = None",
         "        if current_task and command.get('type') in executable_types:",
         "            current_task.cancel()",
         "            await asyncio.gather(current_task, return_exceptions=True)",
-        "        current_task = asyncio.create_task(execute_command(page, command, capture_lock))",
+        "        current_task = asyncio.create_task(execute_command(session, command, capture_lock))",
         "",
         "",
     ]
@@ -1235,21 +1949,23 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
             "        restore_foreground_window(foreground_window)",
             "        stop_event = asyncio.Event()",
             "        capture_lock = asyncio.Lock()",
+            "        session = {'page': page}",
             "        frame_task = None",
             "        command_task = None",
             "        try:",
             "            await emit_frame(page, capture_lock)",
-            "            frame_task = asyncio.create_task(stream_frames(page, stop_event, capture_lock))",
+            "            frame_task = asyncio.create_task(stream_frames(session, stop_event, capture_lock))",
             "            print('SUI_BROWSER_READY', flush=True)",
             "            try:",
-            "                await execute_steps(page, [selected_step], capture_lock)",
+            "                page = await execute_steps(page, [selected_step], capture_lock)",
+            "                session['page'] = page",
             "                print('SUI_ACTION_COMPLETE:' + json.dumps({'status': 'completed', 'action': selected_step.get('type'), 'command_id': selected_step.get('command_id')}), flush=True)",
             "                print('SUI_SESSION_READY', flush=True)",
             "            except Exception as exc:",
             "                print('SUI_ACTION_COMPLETE:' + json.dumps({'status': 'failed', 'error': str(exc), 'action': selected_step.get('type'), 'command_id': selected_step.get('command_id')}), flush=True)",
             "                print('SUI_LOG:Step failed: ' + str(exc), flush=True)",
             "                print('SUI_SESSION_READY', flush=True)",
-            "            command_task = asyncio.create_task(command_loop(page, capture_lock))",
+            "            command_task = asyncio.create_task(command_loop(session, capture_lock))",
             "            done_tasks, pending_tasks = await asyncio.wait({frame_task, command_task}, return_when=asyncio.FIRST_COMPLETED)",
             "            for task in pending_tasks: task.cancel()",
             "            await asyncio.gather(*pending_tasks, return_exceptions=True)",
@@ -1262,9 +1978,10 @@ def _generate_recursive_step_python(definition: dict[str, Any]) -> str:
             "            except Exception: pass",
             "",
             "",
-            "async def stream_frames(page, stop_event, capture_lock):",
+            "async def stream_frames(session, stop_event, capture_lock):",
             "    while not stop_event.is_set():",
             "        try:",
+            "            page = session['page']",
             "            if page.is_closed(): print('SUI_BROWSER_CLOSED:page is closed', flush=True); return",
             "            await emit_frame(page, capture_lock)",
             "        except Exception as exc: print('SUI_FRAME_ERROR:' + str(exc), flush=True); await asyncio.sleep(0.25)",
@@ -1801,6 +2518,11 @@ def stream_job_process(job_id: str, generated_file: Path, definition: dict[str, 
     with JOB_RUNS_CHANGED:
         if job_id in JOB_RUNS:
             JOB_RUNS[job_id]["process"] = process
+            cancelled = bool(JOB_RUNS[job_id].get("cancel_requested"))
+        else:
+            cancelled = False
+    if cancelled:
+        terminate_job_process(process)
 
     stderr_lines: list[str] = []
 
@@ -1823,6 +2545,30 @@ def stream_job_process(job_id: str, generated_file: Path, definition: dict[str, 
     stderr_thread.join()
     return_code = process.wait()
     return return_code, stderr_lines[-1] if stderr_lines else None
+
+
+def terminate_job_process(process: subprocess.Popen | None) -> None:
+    if not process or process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return
+        except OSError:
+            pass
+    try:
+        process.terminate()
+        process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
 
 
 def active_browser_run(scope: tuple[str, str, str, str]) -> tuple[str, dict[str, Any]] | None:
@@ -1855,6 +2601,7 @@ def send_browser_command(run_id: str, command: dict[str, Any], reserve_step: boo
             run["busy_command_id"] = command_id
         try:
             if previous_command_id:
+                run.setdefault("superseded_command_ids", set()).add(previous_command_id)
                 process.stdin.write(json.dumps({"type": "cancel_command", "command_id": previous_command_id}) + "\n")
             process.stdin.write(json.dumps(command) + "\n")
             process.stdin.flush()
@@ -1916,7 +2663,16 @@ def run_step_worker(run_id: str, definition: dict[str, Any], script_path: Path) 
             elif line.startswith("SUI_FRAME_ERROR:"):
                 emit_step_event(run_id, {"type": "log", "message": f"Frame delayed: {line.removeprefix('SUI_FRAME_ERROR:')}", "level": "warning"})
             elif line.startswith("SUI_LOG:"):
-                emit_step_event(run_id, {"type": "log", "message": line.removeprefix("SUI_LOG:")})
+                message = line.removeprefix("SUI_LOG:")
+                command_match = re.search(r"\bcommand_id=([A-Za-z0-9_-]+)", message)
+                if command_match:
+                    with STEP_RUNS_CHANGED:
+                        run_state = STEP_RUNS.get(run_id) or {}
+                        current_command_id = run_state.get("busy_command_id")
+                        superseded_command_ids = run_state.get("superseded_command_ids", set())
+                    if command_match.group(1) in superseded_command_ids or (current_command_id and command_match.group(1) != current_command_id):
+                        continue
+                emit_step_event(run_id, {"type": "log", "message": message})
             elif line.startswith("SUI_BROWSER_CLOSED:"):
                 browser_closed_error = "Browser target closed; run the first Navigate to website step to launch a fresh browser"
                 with STEP_RUNS_CHANGED:
@@ -1987,7 +2743,7 @@ def start_step_run(payload: dict[str, Any]) -> tuple[str, int, str]:
     normalized_step = definition["steps"][0]
     if normalized_step["type"] == "navigate_to_website":
         command = {"type": "navigate", "url": normalized_step["settings"]["url"]}
-    elif normalized_step["type"] in {"navigate", "click", "fill", "check_element_exists", "check_text_exists", "if", "for", "use_js", "keypress", "message_box", "scrape"}:
+    elif normalized_step["type"] in {"navigate", "click", "fill", "check_element_exists", "check_text_exists", "if", "for", "use_js", "keypress", "message_box", "scrape", "writer"}:
         command = {"type": "run_step", "step": normalized_step}
     elif normalized_step["type"] == "delay":
         command = {
@@ -2036,6 +2792,7 @@ def start_step_run(payload: dict[str, Any]) -> tuple[str, int, str]:
                 "starting": True,
                 "command_busy": True,
                 "busy_command_id": command_id,
+                "superseded_command_ids": set(),
                 "last_frame_at": 0.0,
                 "scope": scope,
                 "project_id": project_id,
@@ -2057,16 +2814,51 @@ def finish_job(job_id: str, status: str, error: str | None) -> None:
         add_job_log(job_id, "error", error)
 
 
+def job_cancel_requested(job_id: str) -> bool:
+    with JOB_RUNS_CHANGED:
+        return bool(JOB_RUNS.get(job_id, {}).get("cancel_requested"))
+
+
+def complete_stopped_job(job_id: str) -> None:
+    message = "Stopped by user"
+    with JOB_RUNS_CHANGED:
+        run = JOB_RUNS.get(job_id)
+        if run and run.get("done"):
+            return
+    finish_job(job_id, "stopped", message)
+    emit_job_event(job_id, {"type": "complete", "status": "stopped", "error": message})
+    with JOB_RUNS_CHANGED:
+        run = JOB_RUNS.get(job_id)
+        if run:
+            run["done"] = True
+            run["process"] = None
+        JOB_RUNS_CHANGED.notify_all()
+
+
 def run_job(job_id: str) -> None:
     with db_connection() as connection:
         job = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         if not job:
             return
-        connection.execute("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?", (now_iso(), job_id))
-        version = connection.execute(
-            "SELECT generated_path, definition_json FROM recipe_versions WHERE recipe_id = ? AND version = ?",
-            (job["recipe_id"], job["recipe_version"]),
-        ).fetchone()
+        if job["status"] == "stopped":
+            complete_stopped = True
+        else:
+            complete_stopped = False
+        if complete_stopped:
+            pass
+        else:
+            connection.execute("UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?", (now_iso(), job_id))
+            version = connection.execute(
+                "SELECT generated_path, definition_json FROM recipe_versions WHERE recipe_id = ? AND version = ?",
+                (job["recipe_id"], job["recipe_version"]),
+            ).fetchone()
+    if complete_stopped:
+        emit_job_event(job_id, {"type": "status", "status": "stopped"})
+        complete_stopped_job(job_id)
+        return
+    if job_cancel_requested(job_id):
+        complete_stopped_job(job_id)
+        return
     emit_job_event(job_id, {"type": "status", "status": "running"})
     add_job_log(job_id, "info", f"Running recipe version v{job['recipe_version']}")
     if not version:
@@ -2083,11 +2875,16 @@ def run_job(job_id: str) -> None:
         return finish_job(job_id, "failed", f"Unable to prepare generated recipe: {exc}")
     add_job_log(job_id, "info", f"Launching {'headless' if definition.get('mode') == 'headless' else 'headful'} Chrome for full recipe")
     emit_job_event(job_id, {"type": "log", "level": "info", "message": f"Launching {'headless' if definition.get('mode') == 'headless' else 'headful'} Chrome for full recipe"})
+    if job_cancel_requested(job_id):
+        complete_stopped_job(job_id)
+        return
     try:
         code, stderr_tail = stream_job_process(job_id, generated_file, definition)
     except OSError as exc:
         code, stderr_tail = 126, str(exc)
-    if code == 0:
+    if job_cancel_requested(job_id):
+        complete_stopped_job(job_id)
+    elif code == 0:
         add_job_log(job_id, "info", "Recipe completed successfully")
         emit_job_event(job_id, {"type": "complete", "status": "completed", "error": None})
         finish_job(job_id, "completed", None)
@@ -2119,6 +2916,7 @@ def create_job(recipe_id: str, studio_session_id: str = "projects") -> dict[str,
         JOB_RUNS[job_id] = {
             "events": [{"type": "status", "status": "queued"}],
             "done": False,
+            "cancel_requested": False,
             "process": None,
             "browser_healthy": False,
             "last_frame_at": 0.0,
@@ -2129,6 +2927,34 @@ def create_job(recipe_id: str, studio_session_id: str = "projects") -> dict[str,
         JOB_RUNS_CHANGED.notify_all()
     threading.Thread(target=run_job, args=(job_id,), daemon=True).start()
     return job_response(job, [])
+
+
+def stop_job(job_id: str) -> dict[str, Any] | None:
+    with db_connection() as connection:
+        row = connection.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return None
+        if row["status"] not in {"queued", "running"}:
+            logs = connection.execute("SELECT * FROM job_logs WHERE job_id = ? ORDER BY id ASC", (job_id,)).fetchall()
+            return job_response(row, logs)
+    with JOB_RUNS_CHANGED:
+        run = JOB_RUNS.get(job_id)
+        if run:
+            run["cancel_requested"] = True
+            process = run.get("process")
+        else:
+            process = None
+        JOB_RUNS_CHANGED.notify_all()
+    with db_connection() as connection:
+        connection.execute(
+            "UPDATE jobs SET status = 'stopped', ended_at = ?, error = ? WHERE id = ? AND status IN ('queued', 'running')",
+            (now_iso(), "Stopped by user", job_id),
+        )
+    if process and process.poll() is None:
+        terminate_job_process(process)
+    else:
+        complete_stopped_job(job_id)
+    return get_job(job_id)
 
 
 def job_response(row: sqlite3.Row, logs: list[sqlite3.Row]) -> dict[str, Any]:
@@ -2194,6 +3020,19 @@ class SuiHandler(BaseHTTPRequestHandler):
         try:
             if path == "/api/health":
                 return self.send_payload({"ok": True})
+            if path == "/api/writer/tables":
+                return self.send_payload({"tables": writer_tables()})
+            if path == "/api/writer/schema":
+                query = parse_qs(urlparse(self.path).query)
+                table_name = str(query.get("table", query.get("table_name", [""]))[0] or "")
+                return self.send_payload({"table": table_name, "columns": writer_table_schema(table_name)})
+            if path == "/api/data/tables":
+                return self.send_payload({"tables": viewer_tables()})
+            if path == "/api/data/table":
+                query = parse_qs(urlparse(self.path).query)
+                table_name = str(query.get("table", query.get("name", [""]))[0] or "")
+                limit = query.get("limit", [200])[0]
+                return self.send_payload(viewer_table_data(table_name, limit))
             if path == "/api/projects":
                 return self.send_payload({"projects": list_projects()})
             if path.startswith("/api/projects/"):
@@ -2237,6 +3076,16 @@ class SuiHandler(BaseHTTPRequestHandler):
                     )
                     project = connection.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
                     return self.send_payload(project_response(connection, project), HTTPStatus.CREATED)
+            if path == "/api/data/table":
+                result = craft_table(body.get("table", body.get("name", "")), body.get("columns"))
+                return self.send_payload(result, HTTPStatus.CREATED if result["created"] else HTTPStatus.OK)
+            if path == "/api/data/table/row":
+                result = data_table_row(body.get("table", ""), "insert", raw_values=body.get("values"))
+                return self.send_payload(result, HTTPStatus.CREATED)
+            if path.startswith("/api/jobs/") and path.endswith("/stop"):
+                job_id = path.split("/")[3]
+                job = stop_job(job_id)
+                return self.send_payload(job or {"error": "Job not found"}, HTTPStatus.OK if job else HTTPStatus.NOT_FOUND)
             if path.startswith("/api/projects/") and path.endswith("/recipes"):
                 project_id = path.split("/")[3]
                 saved = save_recipe(project_id, None, body.get("name", ""), body.get("definition") or {})
@@ -2365,6 +3214,15 @@ class SuiHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             body = parse_json_body(self)
+            if path == "/api/data/table/row":
+                result = data_table_row(
+                    body.get("table", ""),
+                    "update",
+                    row_id=body.get("row_id"),
+                    column_name=body.get("column"),
+                    value=body.get("value"),
+                )
+                return self.send_payload(result)
             if path.startswith("/api/recipes/"):
                 recipe_id = path.split("/")[3]
                 with db_connection() as connection:

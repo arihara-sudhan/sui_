@@ -1,5 +1,7 @@
 import ast
 import json
+import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -130,6 +132,8 @@ class GeneratorRegressionTests(unittest.TestCase):
         self.assertIn("previous_command_id", source)
         self.assertIn("Superseded by a newer command", generated)
         self.assertIn("command.get('type') in executable_types", generated)
+        self.assertIn("command_id={step.get('command_id', '')}", generated)
+        self.assertIn("current_command_id", source)
         self.assertNotIn('A step is already running in this browser session', source)
 
     def test_use_js_allows_empty_bindings_and_normalizes_braced_references(self):
@@ -160,6 +164,38 @@ class GeneratorRegressionTests(unittest.TestCase):
         generated = main.generate_step_python(empty)
         self.assertIn("function suiJSRunner(args)", generated)
         self.assertIn("'body': settings.get('code', '')", generated)
+
+    def test_use_js_can_reference_a_for_loop_iterator(self):
+        definition = {
+            "mode": "headless",
+            "steps": [{
+                "id": "step_for",
+                "type": "for",
+                "settings": {"iterator": "i", "start_value": 1, "range_value": "3"},
+                "branches": {"body": [{
+                    "id": "step_js",
+                    "type": "use_js",
+                    "settings": {"code": "return args[0];", "inputs": ["{i}"], "output": ""},
+                }]},
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(normalized["steps"][0]["branches"]["body"][0]["settings"]["inputs"], ["i"])
+
+        with self.assertRaises(ValueError):
+            main.normalize_definition({
+                "mode": "headless",
+                "steps": [{
+                    "id": "step_for",
+                    "type": "for",
+                    "settings": {"iterator": "i", "start_value": 1, "range_value": "3"},
+                    "branches": {"body": [{
+                        "id": "step_js",
+                        "type": "use_js",
+                        "settings": {"code": "return args[0];", "inputs": ["{missing}"], "output": ""},
+                    }]},
+                }],
+            }, "project", "recipe", "recipe", 1, require_first_navigation=False)
 
     def test_check_text_exists_waits_until_timeout_before_not_exists_branch(self):
         definition = {
@@ -253,6 +289,135 @@ class GeneratorRegressionTests(unittest.TestCase):
                 "steps": [{"id": "step_navigate", "type": "navigate", "settings": {"action": "home"}}],
             }, "project", "recipe", "recipe", 1, require_first_navigation=False)
 
+    def test_writer_normalizes_safe_table_and_generates_expression_sql_append(self):
+        definition = {
+            "mode": "headless",
+            "variables": [
+                {"id": "one", "name": "varOne", "value": "Rasa"},
+                {"id": "two", "name": "varTwo", "value": "New York"},
+            ],
+            "steps": [{
+                "id": "step_writer",
+                "type": "writer",
+                "settings": {
+                    "table_name": "events",
+                    "columns": [
+                        {"name": "organizer", "type": "TEXT", "value": '{varOne + "Organizer: " + varTwo}'},
+                        {"name": "event_count", "type": "INTEGER", "value": "2"},
+                    ],
+                },
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        settings = normalized["steps"][0]["settings"]
+        self.assertEqual(settings["table_name"], "events")
+        self.assertEqual([column["name"] for column in settings["columns"]], ["organizer", "event_count"])
+        self.assertEqual(settings["columns"][0]["value"], '{varOne + "Organizer: " + varTwo}')
+        for source in (main.generate_python(normalized), main.generate_step_python(normalized)):
+            ast.parse(source)
+            self.assertIn("write_values_to_sqlite", source)
+            self.assertIn("CREATE TABLE IF NOT EXISTS", source)
+            self.assertIn("INSERT INTO", source)
+            self.assertIn("evaluate_value_expression", source)
+
+        with tempfile.TemporaryDirectory() as directory:
+            source_tree = ast.parse(main.generate_python(normalized))
+            helper_nodes = [node for node in source_tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "write_values_to_sqlite"]
+            namespace = {"os": os, "sqlite3": sqlite3, "WRITER_DB_PATH": str(Path(directory) / "writer.db")}
+            exec(compile(ast.Module(body=helper_nodes, type_ignores=[]), "writer_helper.py", "exec"), namespace)
+            namespace["write_values_to_sqlite"]("events", [
+                {"name": "organizer", "type": "TEXT", "value": "Rasa Organizer: New York", "write": True},
+                {"name": "event_count", "type": "INTEGER", "value": "2", "write": True},
+            ])
+            namespace["write_values_to_sqlite"]("events", [
+                {"name": "organizer", "type": "TEXT", "value": "Second row", "write": True},
+                {"name": "event_count", "type": "INTEGER", "value": "3", "write": True},
+                {"name": "source", "type": "TEXT", "value": "sulekha", "write": True},
+            ])
+            connection = sqlite3.connect(Path(directory) / "writer.db")
+            try:
+                rows = connection.execute('SELECT organizer, event_count FROM "events" ORDER BY rowid').fetchall()
+                columns = connection.execute('PRAGMA table_info("events")').fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(rows, [("Rasa Organizer: New York", 2), ("Second row", 3)])
+            self.assertIn("source", {row[1] for row in columns})
+
+        with self.assertRaises(ValueError):
+            main.normalize_definition({
+                "mode": "headless",
+                "steps": [{"id": "step_writer", "type": "writer", "settings": {"value": "x", "table_name": ""}}],
+            }, "project", "recipe", "recipe", 1, require_first_navigation=False)
+
+    def test_craft_table_creates_and_extends_schema(self):
+        original_db_path = main.DB_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            main.DB_PATH = Path(directory) / "sui.db"
+            try:
+                created = main.craft_table("events", [{"name": "organizer", "type": "TEXT"}])
+                extended = main.craft_table("events", [{"name": "organizer", "type": "TEXT"}, {"name": "event_count", "type": "INTEGER"}])
+                edited = main.craft_table("events", [{"name": "organizer", "original_name": "organizer", "type": "REAL"}, {"name": "event_count", "original_name": "event_count", "type": "INTEGER"}])
+                self.assertTrue(created["created"])
+                self.assertFalse(extended["created"])
+                self.assertEqual([(column["name"], column["type"]) for column in extended["columns"]], [("organizer", "TEXT"), ("event_count", "INTEGER")])
+                self.assertEqual([(column["name"], column["type"]) for column in edited["columns"]], [("organizer", "REAL"), ("event_count", "INTEGER")])
+            finally:
+                main.DB_PATH = original_db_path
+
+    def test_craft_table_can_insert_and_update_rows(self):
+        original_db_path = main.DB_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            main.DB_PATH = Path(directory) / "sui.db"
+            try:
+                main.craft_table("events", [{"name": "title", "type": "TEXT"}, {"name": "count", "type": "INTEGER"}])
+                inserted = main.data_table_row("events", "insert", raw_values={"title": "Opening night", "count": "1"})
+                self.assertEqual(inserted["rows"][0]["title"], "Opening night")
+                row_id = inserted["rows"][0]["__sui_rowid"]
+                updated = main.data_table_row("events", "update", row_id=row_id, column_name="count", value="2")
+                self.assertEqual(updated["rows"][0]["count"], 2)
+            finally:
+                main.DB_PATH = original_db_path
+
+    def test_action_destination_waits_and_active_page_propagates(self):
+        definition = {
+            "mode": "headful",
+            "steps": [
+                {"id": "step_navigation", "type": "navigate_to_website", "settings": {"url": "https://example.com"}},
+                {"id": "step_click", "type": "click", "settings": {
+                    "selector": "#event-{i}",
+                    "expected_url": "https://example.com/detail",
+                    "destination_selector": "#organizer",
+                    "wait_timeout_seconds": 20,
+                }},
+                {"id": "step_key", "type": "keypress", "settings": {
+                    "key": "Enter",
+                    "destination_selector": "#after-key",
+                }},
+                {"id": "step_js", "type": "use_js", "settings": {
+                    "code": "return args[0];",
+                    "inputs": [],
+                    "output": "",
+                    "destination_selector": "#after-js",
+                }},
+            ],
+            "variables": [{"id": "variable_i", "name": "i", "value": "1"}],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(normalized["steps"][1]["settings"]["destination_selector"], "#organizer")
+        self.assertEqual(normalized["steps"][1]["settings"]["wait_timeout_seconds"], 20.0)
+        for source in (main.generate_python(normalized), main.generate_step_python({**normalized, "steps": [normalized["steps"][1]]})):
+            self.assertIn("wait_for_action_destination", source)
+            self.assertIn("destination_selector", source)
+            self.assertIn("new_pages", source)
+            self.assertIn("active_page=", source)
+            self.assertIn("SUI_FRAME_ERROR", source)
+            self.assertIn("PAGE_SOURCES", source)
+            self.assertIn("source_url and page_url(page) == previous_url", source)
+            self.assertIn("Click raised after navigation; continuing", source)
+            self.assertIn("if not navigated: raise", source)
+        self.assertIn("page = execute_steps(page, recipe_steps)", main.generate_python(normalized))
+        self.assertIn("page = await execute_steps(page, (step.get('branches') or {}).get('body', []), capture_lock)", main.generate_step_python({**normalized, "steps": [normalized["steps"][1]]}))
+
     def test_for_loop_normalizes_range_and_generates_nested_body_execution(self):
         definition = {
             "mode": "headless",
@@ -288,6 +453,34 @@ class GeneratorRegressionTests(unittest.TestCase):
                 "steps": [{"id": "step_for", "type": "for", "settings": {"iterator": "i", "range_value": "{missing}"}}],
             }, "project", "recipe", "recipe", 1, require_first_navigation=False)
 
+    def test_for_loop_reads_table_rows_or_column_values(self):
+        row_definition = {
+            "mode": "headless",
+            "steps": [{
+                "id": "step_for_rows",
+                "type": "for",
+                "settings": {"source": "table", "table_mode": "row", "table_name": "events", "iterator": "row"},
+                "branches": {"body": [{"id": "step_message", "type": "message_box", "settings": {"message": "{row.organizer}"}}]},
+            }],
+        }
+        column_definition = {
+            "mode": "headless",
+            "steps": [{
+                "id": "step_for_column",
+                "type": "for",
+                "settings": {"source": "table", "table_mode": "column", "table_name": "events", "column_name": "organizer", "iterator": "organizer"},
+                "branches": {"body": []},
+            }],
+        }
+        normalized_row = main.normalize_definition(row_definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        normalized_column = main.normalize_definition(column_definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        self.assertEqual(normalized_row["steps"][0]["settings"]["table_mode"], "row")
+        self.assertEqual(normalized_column["steps"][0]["settings"]["column_name"], "organizer")
+        for source in (main.generate_python(normalized_row), main.generate_step_python(normalized_row), main.generate_python(normalized_column)):
+            self.assertIn("read_sqlite_table", source)
+            self.assertIn("settings.get('source') == 'table'", source)
+            self.assertIn("Unknown row column", source)
+
     def test_full_and_single_step_paths_wait_for_the_same_resolved_loop_targets(self):
         definition = {
             "mode": "headless",
@@ -313,6 +506,47 @@ class GeneratorRegressionTests(unittest.TestCase):
             self.assertIn("resolve(settings.get('selector'), variables)", source)
             self.assertIn("action + ' target not found for selector '", source)
         self.assertIn("for loop_index in range(loop_start, loop_start + loop_count)", full_source)
+        self.assertIn("execute_steps(page, (step.get('branches') or {}).get('body', []))", full_source)
+
+    def test_click_recovery_and_command_scoped_failure_logging_exist_in_both_paths(self):
+        definition = {
+            "mode": "headless",
+            "steps": [{
+                "id": "step_click",
+                "type": "click",
+                "settings": {"selector": "#event-link"},
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        full_source = main.generate_python(normalized)
+        step_source = main.generate_step_python(normalized)
+        for source in (full_source, step_source):
+            self.assertIn("navigated = page_url(page) != source_url or bool(new_pages(page, before_pages))", source)
+            self.assertIn("if not navigated: raise", source)
+            self.assertIn("command_id={step.get('command_id', '')}", source)
+
+    def test_loop_body_continues_after_bounded_load_completion_delay(self):
+        definition = {
+            "mode": "headful",
+            "steps": [{
+                "id": "step_for",
+                "type": "for",
+                "settings": {"iterator": "i", "start_value": 1, "range_value": "2"},
+                "branches": {"body": [
+                    {"id": "step_delay", "type": "delay", "settings": {"until_load_completes": True}},
+                    {"id": "step_message", "type": "message_box", "settings": {"message": "{i}"}},
+                    {"id": "step_navigate", "type": "navigate", "settings": {"action": "back"}},
+                ]},
+            }],
+        }
+        normalized = main.normalize_definition(definition, "project", "recipe", "recipe", 1, require_first_navigation=False)
+        full_source = main.generate_python(normalized)
+        step_source = main.generate_step_python(normalized)
+        for source in (full_source, step_source):
+            self.assertIn("wait_for_load_completion", source)
+            self.assertIn("30 second limit; continuing", source)
+            self.assertIn("For loop iteration", source)
+        self.assertIn("if settings.get('until_load_completes'): wait_for_load_completion(page)", full_source)
         self.assertIn("execute_steps(page, (step.get('branches') or {}).get('body', []))", full_source)
 
     def test_job_stream_initializes_and_honors_event_cursor(self):
