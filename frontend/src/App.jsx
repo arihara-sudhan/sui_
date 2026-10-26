@@ -46,6 +46,19 @@ const stepLabel = (step) => (
                       : 'Navigate to website'
 )
 
+const friendlyExecutionLog = (message, execution, steps) => {
+  const text = String(message || '')
+  const match = text.match(/^Step\s+(started|completed|failed):\s*([^\s(;,]+)/i)
+  if (!match) return text
+
+  const [, action, stepId] = match
+  const typeMatch = text.match(/^Step\s+(?:started|completed|failed):\s*[^\s(;,]+\s*\(([^)]+)\)/i)
+  const step = findStepInTree(steps, stepId)
+  const stepType = step?.type || typeMatch?.[1] || (execution?.stepId === stepId ? execution.stepType : '')
+  const label = stepType ? stepLabel({ type: stepType }) : 'step'
+  return `Step ${action.toLowerCase()}: ${label}`
+}
+
 const BRANCH_STEP_TYPES = [CHECK_ELEMENT_EXISTS_STEP_TYPE, CHECK_TEXT_EXISTS_STEP_TYPE, IF_STEP_TYPE, FOR_STEP_TYPE]
 const branchNamesForStep = (step) => (
   step.type === IF_STEP_TYPE ? [{ key: 'then', label: 'Exists / true' }, { key: 'else', label: 'Not exists / false' }]
@@ -62,6 +75,66 @@ const findStepInTree = (steps, stepId) => {
     }
   }
   return null
+}
+
+const buildStepExecutionStates = (execution) => {
+  const states = {}
+  for (const entry of execution?.logs || []) {
+    const message = typeof entry === 'string' ? entry : entry?.message
+    const match = String(message || '').match(/^Step\s+(started|completed|failed):\s*([^\s(;,]+)/i)
+    if (!match) continue
+    const [, action, stepId] = match
+    const errorMatch = action.toLowerCase() === 'failed' ? String(message).match(/\berror=(.*)$/i) : null
+    states[stepId] = {
+      status: action.toLowerCase() === 'started' ? 'running' : action.toLowerCase(),
+      error: errorMatch?.[1]?.trim() || '',
+    }
+  }
+
+  if (execution?.stepId && ['running', 'completed', 'failed'].includes(execution.status)) {
+    const current = states[execution.stepId] || {}
+    states[execution.stepId] = {
+      ...current,
+      status: execution.status,
+      error: execution.status === 'failed' ? execution.error || current.error || 'Step failed' : current.error,
+    }
+  }
+  return states
+}
+
+const latestExecutionStepId = (execution) => {
+  let latestId = execution?.stepId || ''
+  for (const entry of execution?.logs || []) {
+    const message = typeof entry === 'string' ? entry : entry?.message
+    const match = String(message || '').match(/^Step\s+(?:started|completed|failed):\s*([^\s(;,]+)/i)
+    if (match) latestId = match[1]
+  }
+  return latestId
+}
+
+const executionStepDetails = (step) => {
+  if (!step) return ''
+  const settings = step.settings || {}
+  const shorten = (value, limit = 110) => {
+    const text = String(value || '').trim()
+    return text.length > limit ? `${text.slice(0, limit)}…` : text
+  }
+  if (step.type === STEP_TYPE) return shorten(settings.url)
+  if (step.type === NAVIGATE_ACTION_STEP_TYPE) return settings.action ? String(settings.action).replace(/^./, (letter) => letter.toUpperCase()) : ''
+  if ([CLICK_STEP_TYPE, CHECK_ELEMENT_EXISTS_STEP_TYPE].includes(step.type)) return settings.selector ? `Selector: ${shorten(settings.selector)}` : ''
+  if (step.type === CHECK_TEXT_EXISTS_STEP_TYPE) return settings.text ? `Text: “${shorten(settings.text, 90)}”` : ''
+  if (step.type === FILL_STEP_TYPE) return settings.selector ? `Selector: ${shorten(settings.selector)}` : ''
+  if (step.type === SCRAPE_STEP_TYPE) return settings.selector ? `Selector: ${shorten(settings.selector)}` : ''
+  if (step.type === DELAY_STEP_TYPE) return settings.until_load_completes ? 'Until page load completes' : settings.seconds ? `${settings.seconds} seconds` : ''
+  if (step.type === KEYPRESS_STEP_TYPE) return settings.key ? `Key: ${settings.key}` : ''
+  if (step.type === ASSIGN_STEP_TYPE) return settings.variable ? `${settings.variable} = ${shorten(settings.value)}` : ''
+  if (step.type === MESSAGE_BOX_STEP_TYPE) return settings.message ? `Message: ${shorten(settings.message, 90)}` : ''
+  if (step.type === WRITER_STEP_TYPE) return settings.table_name ? `Table: ${settings.table_name}` : ''
+  if (step.type === USE_JS_STEP_TYPE) return 'JavaScript action'
+  if (step.type === IF_STEP_TYPE) return [settings.left, settings.operator, settings.right].filter(Boolean).join(' ')
+  if (step.type === FOR_STEP_TYPE) return settings.source === 'table' ? `Table: ${settings.table_name || 'rows'}` : `Range: ${shorten(settings.range_value)}`
+  if ([CALL_RECIPE_STEP_TYPE, INVOKE_RECIPE_STEP_TYPE].includes(step.type)) return settings.recipe_name || settings.recipe_id || ''
+  return ''
 }
 
 const flattenSteps = (steps) => (steps || []).flatMap((step) => [step, ...Object.values(step.branches || {}).flatMap((branch) => flattenSteps(branch))])
@@ -793,6 +866,7 @@ function StudioView({
   const steps = activeRecipe?.definition.steps || []
   const selectedStep = findStepInTree(steps, selectedStepId)
   const allSteps = flattenSteps(steps)
+  const stepExecutionStates = buildStepExecutionStates(execution)
   const callableRecipes = studio.recipes.filter((recipe) => recipe.localKey !== activeRecipeKey && (recipe.id || recipe.name.trim()))
   const invokeRecipes = studio.recipes.filter((recipe) => recipe.id || recipe.name.trim())
   const firstStep = steps[0]
@@ -1217,7 +1291,7 @@ function StudioView({
       return
     }
     setRightMode('viewer')
-    setExecution((current) => ({ ...current, status: 'running', frame: null, logs: [], error: null }))
+    setExecution((current) => ({ ...current, status: 'running', frame: null, logs: [], error: null, stepId: null, stepType: null }))
     try {
       const job = await runFullRecipe(studioSessionId)
       if (!job?.id) return
@@ -1327,9 +1401,11 @@ function StudioView({
   const renderStepList = (items, depth = 0, branchContext = null) => (items || []).map((step, index) => {
     const stepLocked = Boolean(step.disabled) || (requiresInitialNavigation && !(step.id === firstStep?.id && step.type === STEP_TYPE) && !navigationRunCompleted)
     const stepDraggable = !(step.id === firstStep?.id && step.type === STEP_TYPE)
+    const stepExecution = stepExecutionStates[step.id]
+    const executionClass = stepExecution?.status ? ` execution-${stepExecution.status}` : ''
     return (
       <React.Fragment key={step.id}>
-        <div className={`${selectedStepId === step.id ? 'step-list-item selected' : 'step-list-item'}${stepLocked ? ' locked' : ''}${step.disabled ? ' disabled-step' : ''}${depth ? ' nested-step' : ''}${draggedStepId === step.id ? ' dragging' : ''}`} role="button" tabIndex="0" draggable={stepDraggable} onDragStart={(event) => startStepDrag(event, step)} onDragEnd={finishStepDrag} onClick={(event) => {
+        <div className={`${selectedStepId === step.id ? 'step-list-item selected' : 'step-list-item'}${executionClass}${stepLocked ? ' locked' : ''}${step.disabled ? ' disabled-step' : ''}${depth ? ' nested-step' : ''}${draggedStepId === step.id ? ' dragging' : ''}`} title={stepExecution?.status === 'failed' ? stepExecution.error || 'Step failed' : undefined} role="button" tabIndex="0" draggable={stepDraggable} onDragStart={(event) => startStepDrag(event, step)} onDragEnd={finishStepDrag} onClick={(event) => {
           if (event.target.closest('.step-name') || (step.disabled && !event.target.closest('button'))) selectStep(step.id)
           else if (!event.target.closest('button')) setRightMode('viewer')
         }} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') selectStep(step.id) }}>
@@ -1458,6 +1534,7 @@ function StudioView({
                 {(!pickerActive || !execution.pickerElement) && (
                   <ExecutionViewer
                     execution={execution}
+                    steps={steps}
                     onInput={sendViewerInput}
                     pickerActive={pickerActive}
                     pickerEnabled={navigationRunCompleted || activeRecipe?.definition?.recipe_type === 'orchest'}
@@ -1937,22 +2014,20 @@ function SelectorPicker({ execution, pickerTrial, pickerAction, pickerValue, var
   )
 }
 
-function ExecutionViewer({ execution, onInput, pickerActive, pickerEnabled, onPickerToggle }) {
+function ExecutionViewer({ execution, steps, onInput, pickerActive, pickerEnabled, onPickerToggle }) {
   const hoverTimerRef = useRef(null)
   const pendingPointRef = useRef(null)
   useEffect(() => () => {
     if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current)
   }, [])
   const statusLabel = execution.status === 'idle' ? '' : execution.status === 'completed' ? 'Completed' : execution.status === 'failed' ? 'Failed' : 'Running'
-  const latestLog = execution.logs?.length ? execution.logs[execution.logs.length - 1] : ''
-  const friendlyLog = /Click raised after navigation; continuing/i.test(latestLog)
-    ? 'Click completed'
-    : /Step started: .* \(click\)/i.test(latestLog)
-      ? 'Click running'
-      : /Step failed: .* \(click\)/i.test(latestLog)
-        ? 'Click failed'
-        : latestLog
-  const shortLog = friendlyLog.length > 150 ? `${friendlyLog.slice(0, 150)}…` : friendlyLog
+  const stepStates = buildStepExecutionStates(execution)
+  const currentStepId = latestExecutionStepId(execution)
+  const currentStep = findStepInTree(steps, currentStepId) || (execution.stepId === currentStepId && execution.stepType ? { type: execution.stepType } : null)
+  const currentStepState = stepStates[currentStepId]
+  const currentStepStatus = currentStepState?.status || (currentStep ? execution.status : '')
+  const currentStepError = currentStepState?.error || (currentStepStatus === 'failed' ? execution.error : '')
+  const currentStepDetails = executionStepDetails(currentStep)
   const handleKeyDown = (event) => {
     if (!onInput || !(execution.navigationRunId || execution.runId)) return
     if (event.key.length === 1) {
@@ -2022,7 +2097,14 @@ function ExecutionViewer({ execution, onInput, pickerActive, pickerEnabled, onPi
         </button>
       )}
       {execution.frame ? <img src={execution.frame} alt="Live browser execution" /> : <div className="viewer-mark">SUI</div>}
-      {latestLog && <div className="viewer-progress" role="status" title={latestLog}><span>Execution</span><strong>{shortLog}</strong></div>}
+      {currentStep && currentStepStatus && (
+        <div className={`viewer-progress ${currentStepStatus}`} role="status">
+          <span>{currentStepStatus === 'failed' ? 'Failed step' : currentStepStatus === 'running' ? 'Current step' : 'Last step'}</span>
+          <strong>{stepLabel(currentStep)}</strong>
+          {currentStepDetails && <small>{currentStepDetails}</small>}
+          {currentStepStatus === 'failed' && currentStepError && <em>{currentStepError}</em>}
+        </div>
+      )}
       {statusLabel && <span className={`viewer-status ${execution.status}`}>{statusLabel}</span>}
     </div>
   )
@@ -2342,7 +2424,7 @@ function JobsView({ jobs, jobDetail, jobLive, openJob, stopJob, clearDetail }) {
         <div className="job-meta"><span>Started {formatTime(jobDetail.started_at)}</span><span>Ended {formatTime(jobDetail.ended_at)}</span></div>
         {(jobLive?.error || jobDetail.error) && <div className="error-banner">{jobLive?.error || jobDetail.error}</div>}
         {jobLive?.frame && <div className="job-live-viewer"><img src={jobLive.frame} alt="Live full recipe execution" /></div>}
-        <div className="log-panel"><div className="section-label">Logs</div>{liveLogs.length ? liveLogs.map((log, index) => <div className={`log-line ${log.level}`} key={`${jobDetail.id}-live-${index}`}><time>Live</time><span>{log.message}</span></div>) : jobDetail.logs?.length ? jobDetail.logs.map((log) => <div className={`log-line ${log.level}`} key={log.id}><time>{formatTime(log.created_at)}</time><span>{log.message}</span></div>) : <div className="empty-state">No logs yet.</div>}</div>
+        <div className="log-panel"><div className="section-label">Logs</div>{liveLogs.length ? liveLogs.map((log, index) => <div className={`log-line ${log.level}`} key={`${jobDetail.id}-live-${index}`}><time>Live</time><span>{friendlyExecutionLog(log.message, null, [])}</span></div>) : jobDetail.logs?.length ? jobDetail.logs.map((log) => <div className={`log-line ${log.level}`} key={log.id}><time>{formatTime(log.created_at)}</time><span>{friendlyExecutionLog(log.message, null, [])}</span></div>) : <div className="empty-state">No logs yet.</div>}</div>
       </section>
     )
   }

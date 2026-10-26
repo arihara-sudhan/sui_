@@ -3004,7 +3004,9 @@ def handle_job_output(job_id: str, line: str) -> None:
                 run["browser_healthy"] = False
         add_streamed_job_log(job_id, "error", line.removeprefix("SUI_BROWSER_CLOSED:"))
     elif line.startswith("SUI_FRAME_ERROR:"):
-        add_streamed_job_log(job_id, "warning", f"Frame delayed: {line.removeprefix('SUI_FRAME_ERROR:')}")
+        # Frame capture is best-effort. Protocol errors here are noisy implementation
+        # details and should not appear in the user's run log.
+        return
     elif line not in {"SUI_BROWSER_READY", "SUI_READY"}:
         add_streamed_job_log(job_id, "info", line)
 
@@ -3168,7 +3170,9 @@ def run_step_worker(run_id: str, definition: dict[str, Any], script_path: Path) 
                     {"type": "frame", "data": f"data:image/jpeg;base64,{line.removeprefix('SUI_FRAME:')}"},
                 )
             elif line.startswith("SUI_FRAME_ERROR:"):
-                emit_step_event(run_id, {"type": "log", "message": f"Frame delayed: {line.removeprefix('SUI_FRAME_ERROR:')}", "level": "warning"})
+                # Frame capture is best-effort. Keep transient screenshot failures
+                # out of the user-facing run log.
+                continue
             elif line.startswith("SUI_LOG:"):
                 message = line.removeprefix("SUI_LOG:")
                 command_match = re.search(r"\bcommand_id=([A-Za-z0-9_-]+)", message)
