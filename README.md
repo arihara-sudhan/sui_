@@ -26,33 +26,29 @@ The commands below use PowerShell. On macOS or Linux, use the equivalent command
 
 ## Quick start
 
-Run these commands from the project folder:
+Start Sui in two terminals, both opened in the project folder.
+
+**Terminal 1 - backend:**
 
 ```powershell
-uv sync --locked
-Set-Location frontend
-npm ci
-Set-Location ..
+uv sync
+.\.venv\Scripts\activate
+uv run .\main.py
 ```
 
-Start Sui in two terminals.
-
-Terminal 1 - backend:
+**Terminal 2 - frontend:**
 
 ```powershell
-uv run python main.py
-```
-
-Terminal 2 - frontend:
-
-```powershell
-Set-Location frontend
+cd frontend
+npm install
 npm run dev
 ```
 
 Open the Vite URL shown in Terminal 2. It is usually:
 
-<http://localhost:5173>
+http://localhost:5173
+
+Run `uv sync` and `npm install` during initial setup or when dependencies change.
 
 ## Optional: enable Smartie
 
@@ -75,16 +71,16 @@ Keep this key private. `.env` is ignored by Git.
 
 ## Serve the built app from Python
 
-Use this when you want one backend-served app instead of the Vite development server:
+Use this when you want one backend-served app instead of the Vite development server. After installing dependencies, run these commands from the project folder:
 
 ```powershell
-Set-Location frontend
+cd frontend
 npm run build
-Set-Location ..
-uv run python main.py
+cd ..
+uv run .\main.py
 ```
 
-Open <http://127.0.0.1:8000>.
+Open http://127.0.0.1:8000.
 
 Run `npm run build` again whenever you change the frontend.
 
